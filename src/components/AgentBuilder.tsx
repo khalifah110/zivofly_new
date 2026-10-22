@@ -15,7 +15,10 @@ import {
   Save,
   Globe,
   HelpCircle,
+  Search,
+  X,
 } from 'lucide-react';
+import { TIMEZONE_GROUPS } from '../data/timezones';
 
 interface AgentBuilderProps {
   agent: Agent;
@@ -35,6 +38,7 @@ export const AgentBuilder: React.FC<AgentBuilderProps> = ({
   const [platforms, setPlatforms] = useState<PlatformType[]>(agent.platforms || []);
   const [is24x7, setIs24x7] = useState(agent.availability?.is24x7 ?? true);
   const [timezone, setTimezone] = useState(agent.availability?.timezone || 'America/New_York');
+  const [timezoneSearch, setTimezoneSearch] = useState('');
   const [startHour, setStartHour] = useState(agent.availability?.startHour || '08:00');
   const [endHour, setEndHour] = useState(agent.availability?.endHour || '20:00');
   const [isSaving, setIsSaving] = useState(false);
@@ -271,10 +275,29 @@ export const AgentBuilder: React.FC<AgentBuilderProps> = ({
         {!is24x7 && (
           <div className="p-4 bg-neutral-50 rounded-2xl border border-neutral-200 space-y-4 animate-in fade-in">
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              <div>
-                <label className="block text-xs font-semibold text-neutral-700 mb-1">
+              <div className="space-y-2">
+                <label className="block text-xs font-semibold text-neutral-700">
                   Business Timezone
                 </label>
+                <div className="relative">
+                  <Search className="w-3.5 h-3.5 text-neutral-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    type="text"
+                    value={timezoneSearch}
+                    onChange={(e) => setTimezoneSearch(e.target.value)}
+                    placeholder="Search timezone (e.g. Nigeria, London, UTC+1)..."
+                    className="w-full pl-8 pr-7 py-1.5 text-xs border border-neutral-300 rounded-xl bg-white focus:outline-none"
+                  />
+                  {timezoneSearch && (
+                    <button
+                      type="button"
+                      onClick={() => setTimezoneSearch('')}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 text-neutral-400 hover:text-neutral-700"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
                 <div className="relative">
                   <Globe className="w-4 h-4 text-neutral-400 absolute left-3 top-2.5" />
                   <select
@@ -282,13 +305,31 @@ export const AgentBuilder: React.FC<AgentBuilderProps> = ({
                     onChange={(e) => setTimezone(e.target.value)}
                     className="w-full pl-9 pr-3 py-2 text-xs border border-neutral-300 rounded-xl bg-white focus:outline-none"
                   >
-                    <option value="America/New_York">Eastern Time (US & Canada)</option>
-                    <option value="America/Chicago">Central Time (US & Canada)</option>
-                    <option value="America/Los_Angeles">Pacific Time (US & Canada)</option>
-                    <option value="Europe/London">London (GMT / BST)</option>
-                    <option value="Europe/Paris">Paris, Berlin, Rome (CET)</option>
-                    <option value="Asia/Dubai">Dubai (GST)</option>
-                    <option value="Asia/Singapore">Singapore (SGT)</option>
+                    {TIMEZONE_GROUPS.map((group) => {
+                      const q = timezoneSearch.trim().toLowerCase();
+                      const filteredOptions = q
+                        ? group.options.filter(
+                            (opt) =>
+                              opt.value === timezone ||
+                              opt.label.toLowerCase().includes(q) ||
+                              opt.value.toLowerCase().includes(q) ||
+                              group.label.toLowerCase().includes(q) ||
+                              opt.keywords.toLowerCase().includes(q)
+                          )
+                        : group.options;
+
+                      if (filteredOptions.length === 0) return null;
+
+                      return (
+                        <optgroup key={group.label} label={group.label}>
+                          {filteredOptions.map((opt) => (
+                            <option key={opt.value} value={opt.value}>
+                              {opt.label}
+                            </option>
+                          ))}
+                        </optgroup>
+                      );
+                    })}
                   </select>
                 </div>
               </div>

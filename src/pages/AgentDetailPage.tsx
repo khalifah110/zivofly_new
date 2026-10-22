@@ -23,6 +23,7 @@ import {
   ChevronDown,
   ChevronUp,
   Loader2,
+  Search,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { extractTextFromFile, ExtractedDocumentResult } from '../lib/fileTextExtractor';
@@ -48,6 +49,7 @@ import { SalesforceSection } from '../components/SalesforceSection';
 import { HubSpotSection } from '../components/HubSpotSection';
 import { NotificationChannelsSection } from '../components/NotificationChannelsSection';
 import { GOOGLE_SHEET_TEMPLATES } from '../data/sheetTemplates';
+import { TIMEZONE_GROUPS, ALL_TIMEZONES } from '../data/timezones';
 import { WhatItRepliesToSection } from '../components/WhatItRepliesToSection';
 import { DeleteAgentModal } from '../components/DeleteAgentModal';
 import { SimulatorMessageBubble, SimulatorMessage } from '../components/SimulatorMessageBubble';
@@ -203,6 +205,7 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
   const [startHour, setStartHour] = useState(agent?.availability?.startHour || '08:00');
   const [endHour, setEndHour] = useState(agent?.availability?.endHour || '20:00');
   const [timezone, setTimezone] = useState(agent?.availability?.timezone || 'America/New_York');
+  const [timezoneSearch, setTimezoneSearch] = useState('');
   const [activeDays, setActiveDays] = useState(agent?.availability?.activeDays || [0, 1, 2, 3, 4, 5, 6]);
 
   // Knowledge state
@@ -733,10 +736,10 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
         {[
           { key: 'instructions', label: 'Instructions' },
           { key: 'tools', label: 'Agent tools' },
-          { key: 'notifications', label: 'Notifications' },
           { key: 'knowledge', label: 'Knowledge' },
           { key: 'availability', label: 'Availability' },
-          { key: 'try', label: 'Try it' },
+          { key: 'try', label: 'Test Agent' },
+          { key: 'notifications', label: 'Notifications' },
         ].map((tab) => (
           <button
             key={tab.key}
@@ -1333,24 +1336,110 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
                 </div>
 
                 {/* Timezone */}
-                <div className="space-y-1.5">
-                  <label className="text-xs font-semibold text-foreground">
+                <div className="space-y-2.5">
+                  <label className="text-xs font-semibold text-foreground block">
                     Timezone
                   </label>
+
+                  {/* Search bar at the top of Timezone */}
+                  <div className="relative">
+                    <Search className="size-3.5 text-muted-foreground absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                    <input
+                      type="text"
+                      value={timezoneSearch}
+                      onChange={(e) => setTimezoneSearch(e.target.value)}
+                      placeholder="Search timezone by country, city, or UTC offset (e.g. Nigeria, London, India, UTC+1)..."
+                      className="w-full rounded-xl border border-border bg-background pl-9 pr-8 py-2 text-xs text-foreground placeholder:text-muted-foreground focus:border-primary focus:outline-none shadow-2xs"
+                    />
+                    {timezoneSearch && (
+                      <button
+                        type="button"
+                        onClick={() => setTimezoneSearch('')}
+                        className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 rounded-md text-muted-foreground hover:text-foreground cursor-pointer"
+                        aria-label="Clear timezone search"
+                      >
+                        <X className="size-3.5" />
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Quick-select matching results when searching */}
+                  {timezoneSearch.trim() !== '' && (
+                    <div className="max-h-48 overflow-y-auto rounded-xl border border-border bg-background divide-y divide-border shadow-sm">
+                      {(() => {
+                        const q = timezoneSearch.trim().toLowerCase();
+                        const matches = ALL_TIMEZONES.filter(
+                          (tz) =>
+                            tz.label.toLowerCase().includes(q) ||
+                            tz.value.toLowerCase().includes(q) ||
+                            tz.group.toLowerCase().includes(q) ||
+                            tz.keywords.toLowerCase().includes(q)
+                        );
+                        if (matches.length === 0) {
+                          return (
+                            <div className="px-3.5 py-3 text-xs text-muted-foreground">
+                              No matching timezones found for &ldquo;{timezoneSearch}&rdquo;.
+                            </div>
+                          );
+                        }
+                        return matches.map((tz) => {
+                          const isCurrent = timezone === tz.value;
+                          return (
+                            <button
+                              key={tz.value}
+                              type="button"
+                              onClick={() => {
+                                setTimezone(tz.value);
+                                setTimezoneSearch('');
+                              }}
+                              className={`w-full text-left px-3.5 py-2.5 text-xs flex items-center justify-between gap-2 transition-colors cursor-pointer ${
+                                isCurrent
+                                  ? 'bg-primary/10 text-primary font-semibold'
+                                  : 'text-foreground hover:bg-muted/60'
+                              }`}
+                            >
+                              <div>
+                                <div>{tz.label}</div>
+                                <div className="text-[10px] text-muted-foreground">{tz.group} • {tz.value}</div>
+                              </div>
+                              {isCurrent && <CheckCircle2 className="size-3.5 text-primary shrink-0" />}
+                            </button>
+                          );
+                        });
+                      })()}
+                    </div>
+                  )}
+
                   <select
                     value={timezone}
                     onChange={(e) => setTimezone(e.target.value)}
                     className="w-full rounded-xl border border-border bg-background px-3.5 py-2.5 text-xs text-foreground focus:border-primary focus:outline-none shadow-2xs"
                   >
-                    <option value="America/New_York">Eastern Time (ET)</option>
-                    <option value="America/Chicago">Central Time (CT)</option>
-                    <option value="America/Denver">Mountain Time (MT)</option>
-                    <option value="America/Los_Angeles">Pacific Time (PT)</option>
-                    <option value="Europe/London">London (GMT/BST)</option>
-                    <option value="Europe/Paris">Central Europe (CET)</option>
-                    <option value="Asia/Dubai">Gulf Standard Time (GST)</option>
-                    <option value="Asia/Singapore">Singapore Time (SGT)</option>
-                    <option value="Asia/Tokyo">Japan Standard Time (JST)</option>
+                    {TIMEZONE_GROUPS.map((group) => {
+                      const q = timezoneSearch.trim().toLowerCase();
+                      const filteredOptions = q
+                        ? group.options.filter(
+                            (opt) =>
+                              opt.value === timezone ||
+                              opt.label.toLowerCase().includes(q) ||
+                              opt.value.toLowerCase().includes(q) ||
+                              group.label.toLowerCase().includes(q) ||
+                              opt.keywords.toLowerCase().includes(q)
+                          )
+                        : group.options;
+
+                      if (filteredOptions.length === 0) return null;
+
+                      return (
+                        <optgroup key={group.label} label={group.label}>
+                          {filteredOptions.map((opt) => (
+                            <option key={opt.value} value={opt.value}>
+                              {opt.label}
+                            </option>
+                          ))}
+                        </optgroup>
+                      );
+                    })}
                   </select>
                 </div>
               </div>

@@ -10,8 +10,6 @@ import {
   Bot,
   LayoutGrid,
   Coins,
-  Copy,
-  Check,
   LogOut,
   Calendar,
 } from 'lucide-react';
@@ -42,7 +40,6 @@ export const ProfilePage: React.FC<ProfilePageProps> = ({
   // Form edit states
   const [name, setName] = useState(user?.name || '');
   const [isSaving, setIsSaving] = useState(false);
-  const [copiedId, setCopiedId] = useState(false);
 
   // Deletion modal state
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
@@ -54,14 +51,6 @@ export const ProfilePage: React.FC<ProfilePageProps> = ({
       setName(user.name || '');
     }
   }, [user]);
-
-  const handleCopyUserId = () => {
-    if (!user?.id) return;
-    navigator.clipboard.writeText(user.id);
-    setCopiedId(true);
-    toast.success('Account ID copied to clipboard');
-    setTimeout(() => setCopiedId(false), 2000);
-  };
 
   const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -228,29 +217,6 @@ export const ProfilePage: React.FC<ProfilePageProps> = ({
               <p className="text-[11px] text-muted-foreground">
                 Your primary login email address.
               </p>
-            </div>
-
-            <div className="space-y-1.5">
-              <label className="text-xs font-bold text-foreground">
-                Account ID
-              </label>
-              <div className="flex items-center gap-2">
-                <div className="w-full rounded-xl border border-border bg-muted/40 px-3.5 py-2 text-xs font-mono text-muted-foreground truncate select-all">
-                  {user?.id || 'user_default'}
-                </div>
-                <button
-                  type="button"
-                  onClick={handleCopyUserId}
-                  className="p-2 rounded-xl border border-border bg-card text-muted-foreground hover:text-foreground hover:bg-accent transition-colors shrink-0 cursor-pointer shadow-2xs"
-                  title="Copy Account ID"
-                >
-                  {copiedId ? (
-                    <Check className="size-4 text-emerald-600" />
-                  ) : (
-                    <Copy className="size-4" />
-                  )}
-                </button>
-              </div>
             </div>
 
             <div className="pt-3 border-t border-border flex justify-end">

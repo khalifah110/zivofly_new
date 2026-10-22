@@ -308,7 +308,7 @@ export const AgentsPage: React.FC<AgentsPageProps> = ({
                         : 'Custom Agent'}
                     </span>
                     <div className="flex items-center gap-1 font-semibold text-emerald-600 dark:text-emerald-400 group-hover:translate-x-0.5 transition-transform">
-                      <span>Configure</span>
+                      <span>Edit</span>
                       <ArrowRight className="size-3.5" />
                     </div>
                   </div>
