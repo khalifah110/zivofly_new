@@ -24,9 +24,18 @@ import {
   ChevronUp,
   Loader2,
   Search,
+  Sparkles,
+  AlertCircle,
+  RefreshCw,
+  MessageSquare,
+  History,
 } from 'lucide-react';
 import { toast } from 'sonner';
-import { extractTextFromFile, ExtractedDocumentResult } from '../lib/fileTextExtractor';
+import {
+  extractTextFromFile,
+  ExtractedDocumentResult,
+  isCorruptedDocxText,
+} from '../lib/fileTextExtractor';
 import {
   Agent,
   CustomVoiceConfig,
@@ -42,6 +51,23 @@ import {
   ChannelConnection,
 } from '../types';
 import { apiFetch } from '../lib/api';
+import { supabase } from '../lib/supabaseClient';
+import {
+  AgentTestConversation,
+  AgentTestMessageRecord,
+  CONFIG_DOC_TITLE,
+  createSupabaseTestConversation,
+  extractEdgeFunctionDiagnosticError,
+  getSupabaseTestConversationMessages,
+  getSupabaseTestConversations,
+  getVerifiedSupabaseAccessToken,
+  GOOGLE_OAUTH_RETURN_STORAGE_KEY,
+  isValidUuid,
+  mapSupabaseKnowledgeDocToFrontend,
+  processKnowledgeDocument,
+  saveSupabaseConversationFeedback,
+  saveSupabaseTestMessage,
+} from '../lib/supabaseService';
 import { GoogleSheetToolSection } from '../components/GoogleSheetToolSection';
 import { GoogleWorkspaceSection } from '../components/GoogleWorkspaceSection';
 import { Microsoft365Section } from '../components/Microsoft365Section';
@@ -54,6 +80,7 @@ import { WhatItRepliesToSection } from '../components/WhatItRepliesToSection';
 import { DeleteAgentModal } from '../components/DeleteAgentModal';
 import { SimulatorMessageBubble, SimulatorMessage } from '../components/SimulatorMessageBubble';
 import { CustomAgentVoiceSection } from '../components/CustomAgentVoiceSection';
+import { TikTokLogo } from '../components/BrandLogos';
 
 interface AgentDetailPageProps {
   agentId: string;
@@ -79,7 +106,27 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
 
   const [activeTab, setActiveTab] = useState<
     'instructions' | 'tools' | 'notifications' | 'knowledge' | 'availability' | 'try'
-  >('instructions');
+  >(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.has('google_oauth') || params.get('tab') === 'tools') {
+      return 'tools';
+    }
+    try {
+      const saved = sessionStorage.getItem(GOOGLE_OAUTH_RETURN_STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (
+          parsed?.tab === 'tools' &&
+          Date.now() - Number(parsed?.createdAt || 0) < 15 * 60 * 1000
+        ) {
+          return 'tools';
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return 'instructions';
+  });
 
   // Form states (completely empty when creating a new agent)
   const [name, setName] = useState(agent?.name || '');
@@ -94,6 +141,100 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
+
+  // Real workspace_id resolved from application state / database for zivofy_ai
+  const [verifiedWorkspaceId, setVerifiedWorkspaceId] = useState<string | null>(
+    agent?.workspaceId || null
+  );
+  const [simulatorError, setSimulatorError] = useState<{
+    status?: number | string;
+    message: string;
+    isAuthRequired?: boolean;
+  } | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const resolveAgentWorkspace = async () => {
+      if (!supabase || isNewAgent || !agent?.id) {
+        if (!cancelled) {
+          setVerifiedWorkspaceId(null);
+        }
+        return;
+      }
+
+      if (agent.workspaceId && !cancelled) {
+        setVerifiedWorkspaceId(agent.workspaceId);
+      }
+
+      try {
+        const { data: sessionData } = await supabase.auth.getSession();
+        if (!sessionData?.session?.user?.id) {
+          return;
+        }
+
+        const { data: agentRow } = await supabase
+          .from('agents')
+          .select('id, workspace_id')
+          .eq('id', agent.id)
+          .maybeSingle();
+
+        const resolvedWsId = agentRow?.workspace_id || agent.workspaceId || null;
+        if (!cancelled && resolvedWsId) {
+          setVerifiedWorkspaceId(resolvedWsId);
+        }
+
+        // Load actual knowledge_documents rows for this agent from Supabase
+        let docsQuery = supabase
+          .from('knowledge_documents')
+          .select('*')
+          .eq('agent_id', agent.id)
+          .order('created_at', { ascending: false });
+
+        if (resolvedWsId) {
+          docsQuery = docsQuery.eq('workspace_id', resolvedWsId);
+        }
+
+        const { data: docRows, error: docsErr } = await docsQuery;
+        if (!cancelled && !docsErr && Array.isArray(docRows)) {
+          const mappedDocs = docRows
+            .filter(
+              (d) =>
+                d.title !== CONFIG_DOC_TITLE &&
+                d.title !== '__zivofly_agent_ext_config__' &&
+                d.status !== 'deleted'
+            )
+            .map((d) => mapSupabaseKnowledgeDocToFrontend(d));
+          docsRef.current = mappedDocs;
+          setDocs(mappedDocs);
+
+          // Automatically trigger processing for any readable queued or previously failed documents with 0 chunks
+          if (resolvedWsId) {
+            const pendingDocs = mappedDocs.filter(
+              (d) =>
+                (d.status === 'queued' || d.status === 'failed') &&
+                (!d.chunkCount || d.chunkCount === 0) &&
+                d.content.trim().length > 0 &&
+                !isCorruptedDocxText(d.content)
+            );
+            for (const pDoc of pendingDocs) {
+              if (!cancelled) {
+                void triggerDocumentProcessing(resolvedWsId, agent.id, pDoc.id, true);
+              }
+            }
+          }
+        }
+      } catch {
+        // Ignore background lookup failure; explicit actions will check and report any error
+      }
+    };
+
+    resolveAgentWorkspace();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [agent?.id, agent?.workspaceId, isNewAgent]);
 
   useEffect(() => {
     const handleOutsideClick = () => {
@@ -129,9 +270,10 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
 
   const isInstagramActive = (platforms || []).includes('instagram');
   const isFacebookActive = (platforms || []).includes('messenger');
+  const isTikTokActive = (platforms || []).includes('tiktok');
 
-  // What it replies to appears when Instagram or Facebook is connected
-  const showWhatItRepliesTo = isInstagramActive || isFacebookActive;
+  // What it replies to appears when Instagram, TikTok, or Facebook is connected
+  const showWhatItRepliesTo = isInstagramActive || isFacebookActive || isTikTokActive;
 
   // What it replies to state
   const [whatItRepliesTo, setWhatItRepliesTo] = useState<WhatItRepliesToConfig>(() => {
@@ -212,25 +354,135 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
   const [docTitle, setDocTitle] = useState('');
   const [docContent, setDocContent] = useState('');
   const [docs, setDocs] = useState<KnowledgeDocument[]>(agent?.knowledgeDocs || []);
+  const docsRef = useRef<KnowledgeDocument[]>(agent?.knowledgeDocs || []);
+  docsRef.current = docs;
   const [knowledgeMode, setKnowledgeMode] = useState<'upload' | 'manual'>('upload');
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
   const [extractedDoc, setExtractedDoc] = useState<ExtractedDocumentResult | null>(null);
   const [isReadingFile, setIsReadingFile] = useState(false);
+  const [isSavingDoc, setIsSavingDoc] = useState(false);
+  const [processingDocIds, setProcessingDocIds] = useState<string[]>([]);
+  const [deletingDocId, setDeletingDocId] = useState<string | null>(null);
+  const [knowledgeError, setKnowledgeError] = useState<string | null>(null);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
   const [showContentEditor, setShowContentEditor] = useState(false);
   const deviceFileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Try it simulator state
-  const [chatMessages, setChatMessages] = useState<SimulatorMessage[]>([
-    {
-      id: 'initial-greeting',
-      role: 'agent',
-      text: openingLine || `Hello! I'm ${name || 'your agent'}. How can I assist you today?`,
-      timestamp: new Date().toISOString(),
-    },
-  ]);
+  // Try it simulator (persistent test conversations) state
+  const [chatMessages, setChatMessages] = useState<SimulatorMessage[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [isWaitingReply, setIsWaitingReply] = useState(false);
+  const [simulatorConversationId, setSimulatorConversationId] = useState<string | null>(null);
+  const [testConversations, setTestConversations] = useState<AgentTestConversation[]>([]);
+  const [isLoadingTestHistory, setIsLoadingTestHistory] = useState(false);
+  const [isCreatingConversation, setIsCreatingConversation] = useState(false);
+  const chatScrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const activeAgentIdRef = useRef<string | null>(agent?.id || null);
+  activeAgentIdRef.current = agent?.id || null;
+  const simulatorConversationIdRef = useRef<string | null>(null);
+  simulatorConversationIdRef.current = simulatorConversationId;
+
+  const mapTestRecordToSimulatorMessage = (
+    rec: AgentTestMessageRecord
+  ): SimulatorMessage => ({
+    id: rec.id,
+    dbMessageId: rec.id,
+    clientMessageId: rec.client_message_id,
+    sequence: rec.sequence,
+    role: rec.sender_type,
+    text: rec.content,
+    timestamp: rec.created_at,
+    rating: rec.rating,
+    feedback: rec.feedback,
+    feedbackTags: rec.feedbackTags,
+    feedbackId: rec.feedbackId,
+    feedbackCreatedAt: rec.feedbackCreatedAt,
+    saveStatus: 'saved',
+  });
+
+  const scrollTestChatToBottom = () => {
+    requestAnimationFrame(() => {
+      if (chatScrollContainerRef.current) {
+        chatScrollContainerRef.current.scrollTop =
+          chatScrollContainerRef.current.scrollHeight;
+      }
+    });
+  };
+
+  // Reset test conversation state when switching agents so messages from different agents/workspaces never mix
+  useEffect(() => {
+    setTestConversations([]);
+    setSimulatorConversationId(null);
+    simulatorConversationIdRef.current = null;
+    setChatMessages([]);
+    setSimulatorError(null);
+  }, [agent?.id]);
+
+  // Load saved test conversations from Supabase when agent loads or when opening the Test Agent tab
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadSavedTestConversations = async () => {
+      if (!supabase || isNewAgent || !agent?.id || !isValidUuid(agent.id)) {
+        return;
+      }
+
+      setIsLoadingTestHistory(true);
+      try {
+        const savedConvs = await getSupabaseTestConversations({
+          workspaceId: verifiedWorkspaceId || agent.workspaceId || null,
+          agentId: agent.id,
+        });
+
+        if (cancelled || activeAgentIdRef.current !== agent.id) {
+          return;
+        }
+
+        setTestConversations(savedConvs);
+
+        if (savedConvs.length > 0) {
+          const currentConvId = simulatorConversationIdRef.current;
+          const matchingConv =
+            currentConvId && isValidUuid(currentConvId)
+              ? savedConvs.find((c) => c.id === currentConvId)
+              : null;
+          const targetConv = matchingConv || savedConvs[0];
+          setSimulatorConversationId(targetConv.id);
+          setChatMessages(
+            targetConv.messages.map(mapTestRecordToSimulatorMessage)
+          );
+          scrollTestChatToBottom();
+        } else {
+          setSimulatorConversationId(null);
+          setChatMessages([]);
+        }
+      } catch (err: any) {
+        if (!cancelled && activeTab === 'try') {
+          const msg =
+            err?.message || 'Failed to load saved test conversations from Supabase.';
+          const isAuth =
+            msg.includes('401') ||
+            msg.toLowerCase().includes('authentication required') ||
+            msg.toLowerCase().includes('login session');
+          setSimulatorError({
+            status: isAuth ? 401 : 'DB_READ_ERROR',
+            message: msg,
+            isAuthRequired: isAuth,
+          });
+        }
+      } finally {
+        if (!cancelled) {
+          setIsLoadingTestHistory(false);
+        }
+      }
+    };
+
+    void loadSavedTestConversations();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [agent?.id, verifiedWorkspaceId, isNewAgent, activeTab]);
 
   if (!agent && !isNewAgent) {
     return (
@@ -422,28 +674,208 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
     setUploadedFile(file);
     setIsReadingFile(true);
     setShowContentEditor(false);
+    setKnowledgeError(null);
 
     try {
       const extracted = await extractTextFromFile(file);
+      if (!extracted.content.trim() || isCorruptedDocxText(extracted.content)) {
+        throw new Error(
+          `Could not extract readable text from "${file.name}". Please ensure it is a valid document.`
+        );
+      }
       setExtractedDoc(extracted);
       setDocTitle(extracted.title);
       setDocContent(extracted.content);
-      toast.success(`Loaded "${file.name}" from your device`);
-    } catch (err) {
+      toast.success(`Extracted readable text from "${file.name}"`);
+    } catch (err: any) {
       console.error('File parsing error:', err);
-      toast.error('Could not extract text from document. You can still paste its text manually.');
+      const errMsg =
+        err?.message ||
+        'Could not extract readable text from document. Please verify the file or enter text manually.';
+      setUploadedFile(null);
+      setExtractedDoc(null);
+      setDocTitle('');
+      setDocContent('');
+      if (deviceFileInputRef.current) {
+        deviceFileInputRef.current.value = '';
+      }
+      setKnowledgeError(errMsg);
+      toast.error(errMsg);
     } finally {
       setIsReadingFile(false);
     }
   };
 
-  const handleAddUploadedDoc = () => {
+  const resolveKnowledgeWorkspaceAndAgent = async (): Promise<{
+    workspaceId: string;
+    agentId: string;
+  }> => {
+    if (!supabase) {
+      throw new Error('Supabase client is not configured.');
+    }
+
+    const { data: sessionData, error: sessionErr } = await supabase.auth.getSession();
+    if (sessionErr || !sessionData?.session?.user) {
+      throw new Error(
+        sessionErr?.message ||
+          'Authentication required: Please log in to save documents to the Knowledge Base.'
+      );
+    }
+
+    const currentAgentId = !isNewAgent && agent?.id ? agent.id : null;
+    if (!currentAgentId) {
+      throw new Error(
+        'Please save and create this agent first before adding documents to its Knowledge Base.'
+      );
+    }
+
+    let workspaceId = verifiedWorkspaceId || agent?.workspaceId || null;
+
+    if (!workspaceId) {
+      const { data: agentRow, error: agentLookupErr } = await supabase
+        .from('agents')
+        .select('id, workspace_id')
+        .eq('id', currentAgentId)
+        .maybeSingle();
+
+      if (agentLookupErr) {
+        throw new Error(agentLookupErr.message);
+      }
+
+      if (agentRow?.workspace_id) {
+        workspaceId = agentRow.workspace_id;
+        setVerifiedWorkspaceId(workspaceId);
+      }
+    }
+
+    if (!workspaceId) {
+      const userId = sessionData.session.user.id;
+      const { data: memberRows, error: memberErr } = await supabase
+        .from('workspace_members')
+        .select('workspace_id')
+        .eq('user_id', userId)
+        .limit(1);
+
+      if (memberErr) {
+        throw new Error(memberErr.message);
+      }
+
+      if (memberRows && memberRows.length > 0 && memberRows[0].workspace_id) {
+        workspaceId = memberRows[0].workspace_id;
+        setVerifiedWorkspaceId(workspaceId);
+      } else {
+        const { data: ownedWs, error: ownedErr } = await supabase
+          .from('workspaces')
+          .select('id')
+          .eq('owner_user_id', userId)
+          .limit(1);
+
+        if (ownedErr) {
+          throw new Error(ownedErr.message);
+        }
+
+        if (ownedWs && ownedWs.length > 0 && ownedWs[0].id) {
+          workspaceId = ownedWs[0].id;
+          setVerifiedWorkspaceId(workspaceId);
+        }
+      }
+    }
+
+    if (!workspaceId) {
+      throw new Error(
+        'Could not resolve workspace_id for the authenticated user and selected agent.'
+      );
+    }
+
+    return { workspaceId, agentId: currentAgentId };
+  };
+
+  const updateDocInState = (updatedDoc: KnowledgeDocument, workspaceId?: string) => {
+    const prev = docsRef.current;
+    const exists = prev.some((d) => d.id === updatedDoc.id);
+    const next = exists
+      ? prev.map((d) => (d.id === updatedDoc.id ? updatedDoc : d))
+      : [updatedDoc, ...prev];
+    docsRef.current = next;
+    setDocs(next);
+    if (agent) {
+      onAgentUpdated({
+        ...agent,
+        workspaceId: workspaceId || verifiedWorkspaceId || agent.workspaceId,
+        knowledgeDocs: next,
+      });
+    }
+  };
+
+  const triggerDocumentProcessing = async (
+    workspaceId: string,
+    targetAgentId: string,
+    documentId: string,
+    silentStart = false
+  ): Promise<KnowledgeDocument | null> => {
+    setProcessingDocIds((prev) =>
+      prev.includes(documentId) ? prev : [...prev, documentId]
+    );
+    if (!silentStart) {
+      setKnowledgeError(null);
+    }
+
+    try {
+      const processedDoc = await processKnowledgeDocument({
+        workspaceId,
+        agentId: targetAgentId,
+        documentId,
+        onStatusChange: (statusDoc) => {
+          updateDocInState(statusDoc, workspaceId);
+        },
+      });
+
+      updateDocInState(processedDoc, workspaceId);
+      toast.success(
+        `"${processedDoc.name}" processed into ${processedDoc.chunkCount} chunk${
+          processedDoc.chunkCount === 1 ? '' : 's'
+        } and is now Ready`
+      );
+      return processedDoc;
+    } catch (procErr: any) {
+      const procMsg =
+        procErr?.message ||
+        'Document was saved, but chunking and embedding generation failed.';
+      setKnowledgeError(procMsg);
+      toast.error(procMsg);
+      return null;
+    } finally {
+      setProcessingDocIds((prev) => prev.filter((id) => id !== documentId));
+    }
+  };
+
+  const handleRetryProcessDoc = async (docId: string) => {
+    if (processingDocIds.includes(docId)) return;
+    try {
+      const { workspaceId, agentId: targetAgentId } =
+        await resolveKnowledgeWorkspaceAndAgent();
+      await triggerDocumentProcessing(workspaceId, targetAgentId, docId, false);
+    } catch (err: any) {
+      const msg = err?.message || 'Unable to process document.';
+      setKnowledgeError(msg);
+      toast.error(msg);
+    }
+  };
+
+  const handleAddUploadedDoc = async () => {
+    if (isSavingDoc) return;
+
     if (!uploadedFile && !extractedDoc) {
       toast.error('Please choose a file from your device first.');
       return;
     }
 
-    const finalTitle = (docTitle.trim() || extractedDoc?.title || uploadedFile?.name || 'Document').trim();
+    const finalTitle = (
+      docTitle.trim() ||
+      extractedDoc?.title ||
+      uploadedFile?.name ||
+      'Document'
+    ).trim();
     const finalContent = (docContent.trim() || extractedDoc?.content || '').trim();
 
     if (!finalContent) {
@@ -451,26 +883,130 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
       return;
     }
 
-    const newDoc: KnowledgeDocument = {
-      id: `doc_${Date.now()}`,
-      name: finalTitle,
-      content: finalContent,
-      type: extractedDoc?.type || (uploadedFile?.name.endsWith('.pdf') ? 'pdf' : 'text'),
-      chunkCount: Math.max(1, Math.ceil(finalContent.length / 400)),
-      fileSize: extractedDoc?.fileSize || `${Math.max(1, Math.round(finalContent.length / 1024))} KB`,
-      createdAt: new Date().toISOString(),
-    };
-
-    setDocs((prev) => [newDoc, ...prev]);
-    setUploadedFile(null);
-    setExtractedDoc(null);
-    setDocTitle('');
-    setDocContent('');
-    setShowContentEditor(false);
-    if (deviceFileInputRef.current) {
-      deviceFileInputRef.current.value = '';
+    if (isCorruptedDocxText(finalContent)) {
+      const corruptMsg =
+        'The extracted text contains raw DOCX XML/ZIP metadata (Content_Types, document.xml, styles.xml) and cannot be saved. Please re-select a valid .docx file.';
+      setKnowledgeError(corruptMsg);
+      toast.error(corruptMsg);
+      return;
     }
-    toast.success(`"${finalTitle}" added to knowledge base`);
+
+    setIsSavingDoc(true);
+    setKnowledgeError(null);
+
+    try {
+      const { workspaceId, agentId: targetAgentId } = await resolveKnowledgeWorkspaceAndAgent();
+      const fileSizeBytes = new TextEncoder().encode(finalContent).length;
+      const mimeType =
+        uploadedFile?.type ||
+        (uploadedFile?.name.toLowerCase().endsWith('.pdf')
+          ? 'application/pdf'
+          : uploadedFile?.name.toLowerCase().endsWith('.docx')
+          ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+          : 'text/plain');
+      const formattedSize =
+        extractedDoc?.fileSize || `${Math.max(1, Math.round(fileSizeBytes / 1024))} KB`;
+
+      // Check if there is an existing failed/corrupted document with the same title so we can repair it in place
+      const existingFailedDoc = docsRef.current.find(
+        (d) =>
+          d.name.trim().toLowerCase() === finalTitle.toLowerCase() &&
+          (d.status === 'failed' || isCorruptedDocxText(d.content))
+      );
+
+      let targetDocRow: any = null;
+      let saveError: any = null;
+
+      if (existingFailedDoc) {
+        const { data: updatedRow, error: updateErr } = await supabase!
+          .from('knowledge_documents')
+          .update({
+            title: finalTitle,
+            source_type: 'file',
+            content_text: finalContent,
+            mime_type: mimeType,
+            file_size_bytes: fileSizeBytes,
+            chunk_count: 0,
+            status: 'queued',
+            error_message: null,
+            metadata: {
+              fileSize: formattedSize,
+              type:
+                extractedDoc?.type ||
+                (uploadedFile?.name.toLowerCase().endsWith('.pdf') ? 'pdf' : 'text'),
+              originalFileName: uploadedFile?.name || finalTitle,
+            },
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', existingFailedDoc.id)
+          .eq('workspace_id', workspaceId)
+          .select('*')
+          .single();
+
+        targetDocRow = updatedRow;
+        saveError = updateErr;
+      } else {
+        const { data: insertedRow, error: insertErr } = await supabase!
+          .from('knowledge_documents')
+          .insert({
+            workspace_id: workspaceId,
+            agent_id: targetAgentId,
+            title: finalTitle,
+            source_type: 'file',
+            storage_path: null,
+            source_url: null,
+            content_text: finalContent,
+            mime_type: mimeType,
+            file_size_bytes: fileSizeBytes,
+            chunk_count: 0,
+            status: 'queued',
+            error_message: null,
+            metadata: {
+              fileSize: formattedSize,
+              type:
+                extractedDoc?.type ||
+                (uploadedFile?.name.toLowerCase().endsWith('.pdf') ? 'pdf' : 'text'),
+              originalFileName: uploadedFile?.name || finalTitle,
+            },
+          })
+          .select('*')
+          .single();
+
+        targetDocRow = insertedRow;
+        saveError = insertErr;
+      }
+
+      if (saveError || !targetDocRow) {
+        const errMessage = saveError
+          ? `${saveError.message}${saveError.details ? ` (${saveError.details})` : ''}`
+          : 'Failed to save document into knowledge_documents.';
+        setKnowledgeError(errMessage);
+        toast.error(errMessage);
+        return;
+      }
+
+      const queuedDoc = mapSupabaseKnowledgeDocToFrontend(targetDocRow);
+      updateDocInState(queuedDoc, workspaceId);
+
+      setUploadedFile(null);
+      setExtractedDoc(null);
+      setDocTitle('');
+      setDocContent('');
+      setShowContentEditor(false);
+      if (deviceFileInputRef.current) {
+        deviceFileInputRef.current.value = '';
+      }
+
+      // Immediately process content_text into knowledge_chunks with text-embedding-3-small
+      await triggerDocumentProcessing(workspaceId, targetAgentId, targetDocRow.id, false);
+    } catch (err: any) {
+      const errMessage =
+        err?.message || 'An unexpected error occurred while saving the document.';
+      setKnowledgeError(errMessage);
+      toast.error(errMessage);
+    } finally {
+      setIsSavingDoc(false);
+    }
   };
 
   const handleResetUploadedFile = () => {
@@ -478,128 +1014,843 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
     setExtractedDoc(null);
     setDocTitle('');
     setDocContent('');
+    setKnowledgeError(null);
     setShowContentEditor(false);
     if (deviceFileInputRef.current) {
       deviceFileInputRef.current.value = '';
     }
   };
 
-  const handleAddDoc = () => {
-    if (!docTitle.trim() || !docContent.trim()) {
+  const handleAddDoc = async () => {
+    if (isSavingDoc) return;
+
+    const trimmedTitle = docTitle.trim();
+    const trimmedContent = docContent.trim();
+
+    if (!trimmedTitle || !trimmedContent) {
       toast.error('Please provide a title and content for the knowledge document.');
       return;
     }
-    const newDoc: KnowledgeDocument = {
-      id: String(Date.now()),
-      name: docTitle.trim(),
-      content: docContent.trim(),
-      type: 'text',
-      chunkCount: Math.ceil(docContent.length / 500) || 1,
-      createdAt: new Date().toISOString(),
-    };
-    setDocs([...docs, newDoc]);
-    setDocTitle('');
-    setDocContent('');
-    toast.success('Knowledge document added');
+
+    if (isCorruptedDocxText(trimmedContent)) {
+      const corruptMsg =
+        'The entered content contains raw DOCX XML/ZIP metadata (Content_Types, document.xml, styles.xml). Please enter readable plain text.';
+      setKnowledgeError(corruptMsg);
+      toast.error(corruptMsg);
+      return;
+    }
+
+    setIsSavingDoc(true);
+    setKnowledgeError(null);
+
+    try {
+      const { workspaceId, agentId: targetAgentId } = await resolveKnowledgeWorkspaceAndAgent();
+      const fileSizeBytes = new TextEncoder().encode(trimmedContent).length;
+      const formattedSize = `${Math.max(1, Math.round(fileSizeBytes / 1024))} KB`;
+
+      // Prevent duplicate documents if a failed/queued document with the same title already exists
+      const existingPendingOrFailedDoc = docsRef.current.find(
+        (d) =>
+          d.name.trim().toLowerCase() === trimmedTitle.toLowerCase() &&
+          (d.status === 'failed' || d.status === 'queued')
+      );
+
+      let targetDocRow: any = null;
+      let saveError: any = null;
+
+      if (existingPendingOrFailedDoc) {
+        const { data: updatedRow, error: updateErr } = await supabase!
+          .from('knowledge_documents')
+          .update({
+            title: trimmedTitle,
+            source_type: 'text',
+            content_text: trimmedContent,
+            mime_type: 'text/plain',
+            file_size_bytes: fileSizeBytes,
+            chunk_count: 0,
+            status: 'queued',
+            error_message: null,
+            metadata: {
+              fileSize: formattedSize,
+              type: 'text',
+            },
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', existingPendingOrFailedDoc.id)
+          .eq('workspace_id', workspaceId)
+          .select('*')
+          .single();
+
+        targetDocRow = updatedRow;
+        saveError = updateErr;
+      } else {
+        const { data: insertedRow, error: insertError } = await supabase!
+          .from('knowledge_documents')
+          .insert({
+            workspace_id: workspaceId,
+            agent_id: targetAgentId,
+            title: trimmedTitle,
+            source_type: 'text',
+            storage_path: null,
+            source_url: null,
+            content_text: trimmedContent,
+            mime_type: 'text/plain',
+            file_size_bytes: fileSizeBytes,
+            chunk_count: 0,
+            status: 'queued',
+            error_message: null,
+            metadata: {
+              fileSize: formattedSize,
+              type: 'text',
+            },
+          })
+          .select('*')
+          .single();
+
+        targetDocRow = insertedRow;
+        saveError = insertError;
+      }
+
+      if (saveError || !targetDocRow) {
+        const errMessage = saveError
+          ? `${saveError.message}${saveError.details ? ` (${saveError.details})` : ''}`
+          : 'Failed to insert document into knowledge_documents.';
+        setKnowledgeError(errMessage);
+        toast.error(errMessage);
+        return;
+      }
+
+      const queuedDoc = mapSupabaseKnowledgeDocToFrontend(targetDocRow);
+      updateDocInState(queuedDoc, workspaceId);
+
+      setDocTitle('');
+      setDocContent('');
+
+      // Immediately process document via zivofy_ai Edge Function
+      await triggerDocumentProcessing(workspaceId, targetAgentId, targetDocRow.id, false);
+    } catch (err: any) {
+      const errMessage =
+        err?.message || 'An unexpected error occurred while saving the document.';
+      setKnowledgeError(errMessage);
+      toast.error(errMessage);
+    } finally {
+      setIsSavingDoc(false);
+    }
   };
 
-  const handleDeleteDoc = (id: string) => {
-    setDocs(docs.filter((d) => d.id !== id));
-    toast.info('Knowledge document removed');
+  const handleDeleteDoc = async (id: string) => {
+    if (deletingDocId === id) return;
+    setDeletingDocId(id);
+    setKnowledgeError(null);
+
+    try {
+      const { workspaceId } = await resolveKnowledgeWorkspaceAndAgent();
+
+      // Remove associated chunks first
+      await supabase!
+        .from('knowledge_chunks')
+        .delete()
+        .eq('document_id', id)
+        .eq('workspace_id', workspaceId);
+
+      const { error: deleteError } = await supabase!
+        .from('knowledge_documents')
+        .delete()
+        .eq('id', id)
+        .eq('workspace_id', workspaceId);
+
+      if (deleteError) {
+        const errMessage = `${deleteError.message}${
+          deleteError.details ? ` (${deleteError.details})` : ''
+        }`;
+        setKnowledgeError(errMessage);
+        toast.error(errMessage);
+        return;
+      }
+
+      const nextDocs = docs.filter((d) => d.id !== id);
+      setDocs(nextDocs);
+      if (agent) {
+        onAgentUpdated({
+          ...agent,
+          workspaceId,
+          knowledgeDocs: nextDocs,
+        });
+      }
+      toast.info('Knowledge document removed');
+    } catch (err: any) {
+      const errMessage =
+        err?.message || 'Failed to delete document from knowledge_documents.';
+      setKnowledgeError(errMessage);
+      toast.error(errMessage);
+    } finally {
+      setDeletingDocId(null);
+    }
   };
 
-  const handleUpdateFeedback = (messageId: string, rating: number, feedback: string) => {
+  const handleUpdateFeedback = async (
+    messageId: string,
+    rating: number,
+    feedback: string,
+    tags: string[] = []
+  ): Promise<void> => {
+    const { workspaceId, agentId: currentAgentId } =
+      await resolveKnowledgeWorkspaceAndAgent();
+
+    if (!isValidUuid(currentAgentId)) {
+      throw new Error(
+        'A valid saved agent is required before submitting feedback.'
+      );
+    }
+
+    const targetMsg = chatMessages.find((m) => m.id === messageId);
+    const realConversationId = isValidUuid(simulatorConversationId)
+      ? simulatorConversationId
+      : null;
+    const candidateMessageId = targetMsg?.dbMessageId || messageId;
+    const realMessageId = isValidUuid(candidateMessageId)
+      ? candidateMessageId
+      : null;
+
+    const savedRecord = await saveSupabaseConversationFeedback({
+      workspaceId,
+      agentId: currentAgentId,
+      conversationId: realConversationId,
+      messageId: realMessageId,
+      feedbackId: targetMsg?.feedbackId || null,
+      rating,
+      comment: feedback,
+      tags,
+    });
+
+    // Update the local chat display and conversation history only after Supabase confirms persistence
     setChatMessages((prev) =>
       prev.map((msg) =>
         msg.id === messageId
-          ? { ...msg, rating, feedback, feedbackCreatedAt: new Date().toISOString() }
+          ? {
+              ...msg,
+              rating: savedRecord.rating,
+              feedback: savedRecord.comment || '',
+              feedbackTags: savedRecord.tags || [],
+              feedbackId: savedRecord.id,
+              feedbackCreatedAt: savedRecord.created_at,
+            }
           : msg
       )
     );
+
+    if (realConversationId && realMessageId) {
+      setTestConversations((prev) =>
+        prev.map((conv) =>
+          conv.id === realConversationId
+            ? {
+                ...conv,
+                messages: conv.messages.map((m) =>
+                  m.id === realMessageId
+                    ? {
+                        ...m,
+                        rating: savedRecord.rating,
+                        feedback: savedRecord.comment || '',
+                        feedbackTags: savedRecord.tags || [],
+                        feedbackId: savedRecord.id,
+                        feedbackCreatedAt: savedRecord.created_at,
+                      }
+                    : m
+                ),
+              }
+            : conv
+        )
+      );
+    }
   };
 
-  const handleClearChat = () => {
-    setChatMessages([
-      {
-        id: `greeting-${Date.now()}`,
-        role: 'agent',
-        text: openingLine || `Hello! I'm ${name || 'your agent'}. How can I assist you today?`,
-        timestamp: new Date().toISOString(),
-      },
-    ]);
-    toast.info('Simulator reset');
+  /**
+   * Starts a completely new persistent test conversation in Supabase (`public.conversations`),
+   * generating a new unique conversation ID while keeping all previous test conversations saved.
+   * Displays the new conversation as an empty conversation before the agent responds.
+   */
+  const handleStartNewConversation = async () => {
+    if (isCreatingConversation || isWaitingReply) return;
+
+    setSimulatorError(null);
+    setIsCreatingConversation(true);
+
+    try {
+      const { workspaceId, agentId: currentAgentId } =
+        await resolveKnowledgeWorkspaceAndAgent();
+
+      const newConv = await createSupabaseTestConversation({
+        workspaceId,
+        agentId: currentAgentId,
+      });
+
+      setTestConversations((prev) => [
+        newConv,
+        ...prev.filter((c) => c.id !== newConv.id),
+      ]);
+      setSimulatorConversationId(newConv.id);
+      setChatMessages([]);
+      setChatInput('');
+      toast.success('Started a new test conversation');
+    } catch (err: any) {
+      const errMsg =
+        err?.message || 'Failed to start a new test conversation in Supabase.';
+      const isAuth =
+        errMsg.includes('401') ||
+        errMsg.toLowerCase().includes('authentication required');
+      setSimulatorError({
+        status: isAuth ? 401 : 'CREATE_CONVERSATION_ERROR',
+        message: errMsg,
+        isAuthRequired: isAuth,
+      });
+      toast.error(errMsg);
+    } finally {
+      setIsCreatingConversation(false);
+    }
+  };
+
+  /**
+   * Switches to a previously saved test conversation from the conversation history list
+   * and restores its ordered messages from Supabase.
+   */
+  const handleSelectTestConversation = async (targetConvId: string) => {
+    if (
+      !isValidUuid(targetConvId) ||
+      isWaitingReply ||
+      isCreatingConversation
+    ) {
+      return;
+    }
+
+    setSimulatorError(null);
+    setSimulatorConversationId(targetConvId);
+
+    const existingConv = testConversations.find((c) => c.id === targetConvId);
+    if (existingConv) {
+      setChatMessages(
+        existingConv.messages.map(mapTestRecordToSimulatorMessage)
+      );
+      scrollTestChatToBottom();
+    }
+
+    try {
+      const { workspaceId, agentId: currentAgentId } =
+        await resolveKnowledgeWorkspaceAndAgent();
+      const freshMessages = await getSupabaseTestConversationMessages({
+        workspaceId,
+        agentId: currentAgentId,
+        conversationId: targetConvId,
+      });
+
+      if (activeAgentIdRef.current !== currentAgentId) return;
+
+      setChatMessages(freshMessages.map(mapTestRecordToSimulatorMessage));
+      setTestConversations((prev) =>
+        prev.map((c) =>
+          c.id === targetConvId
+            ? {
+                ...c,
+                messages: freshMessages,
+                message_count: freshMessages.length,
+                last_message_text:
+                  freshMessages[freshMessages.length - 1]?.content ||
+                  c.last_message_text,
+              }
+            : c
+        )
+      );
+      scrollTestChatToBottom();
+    } catch (err: any) {
+      const errMsg =
+        err?.message || 'Failed to load messages for the selected conversation.';
+      setSimulatorError({
+        status: 'LOAD_CONVERSATION_ERROR',
+        message: errMsg,
+      });
+    }
+  };
+
+  /**
+   * Retries saving a message whose persistence to `public.messages` previously failed,
+   * without losing the message or creating duplicates.
+   */
+  const handleRetrySaveMessage = async (failedMsg: SimulatorMessage) => {
+    if (isWaitingReply) return;
+    setSimulatorError(null);
+
+    try {
+      const { workspaceId, agentId: currentAgentId } =
+        await resolveKnowledgeWorkspaceAndAgent();
+
+      let activeConvId =
+        simulatorConversationId && isValidUuid(simulatorConversationId)
+          ? simulatorConversationId
+          : null;
+
+      if (!activeConvId) {
+        const createdConv = await createSupabaseTestConversation({
+          workspaceId,
+          agentId: currentAgentId,
+          title: failedMsg.text.slice(0, 60),
+        });
+        activeConvId = createdConv.id;
+        setSimulatorConversationId(createdConv.id);
+        setTestConversations((prev) => [
+          createdConv,
+          ...prev.filter((c) => c.id !== createdConv.id),
+        ]);
+      }
+
+      setChatMessages((prev) =>
+        prev.map((m) =>
+          m.id === failedMsg.id
+            ? { ...m, saveStatus: 'saving', saveError: undefined }
+            : m
+        )
+      );
+
+      const savedMsg = await saveSupabaseTestMessage({
+        workspaceId,
+        agentId: currentAgentId,
+        conversationId: activeConvId,
+        sender: failedMsg.role,
+        content: failedMsg.text,
+        clientMessageId: failedMsg.clientMessageId || `retry-${failedMsg.id}`,
+        sequence: failedMsg.sequence,
+        existingDbMessageId: failedMsg.dbMessageId,
+      });
+
+      setChatMessages((prev) =>
+        prev.map((m) =>
+          m.id === failedMsg.id
+            ? {
+                ...m,
+                id: savedMsg.id,
+                dbMessageId: savedMsg.id,
+                timestamp: savedMsg.created_at,
+                saveStatus: 'saved',
+                saveError: undefined,
+              }
+            : m
+        )
+      );
+
+      setTestConversations((prev) =>
+        prev.map((conv) => {
+          if (conv.id !== activeConvId) return conv;
+          const exists = conv.messages.some((m) => m.id === savedMsg.id);
+          const nextMsgs = exists
+            ? conv.messages
+            : [...conv.messages, savedMsg];
+          return {
+            ...conv,
+            title:
+              failedMsg.role === 'customer' &&
+              (conv.title === 'New Test Conversation' || !conv.title)
+                ? failedMsg.text.slice(0, 56)
+                : conv.title,
+            last_message_at: savedMsg.created_at,
+            last_message_text: savedMsg.content,
+            message_count: nextMsgs.length,
+            messages: nextMsgs,
+          };
+        })
+      );
+
+      toast.success('Message saved to Supabase');
+    } catch (err: any) {
+      const errMsg = err?.message || 'Failed to save message to Supabase.';
+      setChatMessages((prev) =>
+        prev.map((m) =>
+          m.id === failedMsg.id
+            ? { ...m, saveStatus: 'failed', saveError: errMsg }
+            : m
+        )
+      );
+      setSimulatorError({ status: 'SAVE_ERROR', message: errMsg });
+      toast.error(errMsg);
+    }
   };
 
   const handleSimulateChat = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!chatInput.trim() || isWaitingReply) return;
+    if (!chatInput.trim() || isWaitingReply || isCreatingConversation) return;
 
-    const userText = chatInput.trim();
-    const customerMsgId = `cust-${Date.now()}`;
-    const agentMsgId = `agent-${Date.now() + 1}`;
+    const message = chatInput.trim();
+    setSimulatorError(null);
+
+    if (!supabase) {
+      const configMsg = 'Supabase client is not configured.';
+      console.error('[Test Agent] zivofy_ai error:', {
+        status: 'CONFIG_ERROR',
+        message: configMsg,
+      });
+      setSimulatorError({ status: 'CONFIG_ERROR', message: configMsg });
+      return;
+    }
+
+    // 1. Verify active authenticated session & ensure fresh user JWT using the existing Supabase client
+    let accessToken = '';
+    try {
+      const verified = await getVerifiedSupabaseAccessToken();
+      accessToken = verified.accessToken;
+    } catch (authErr: any) {
+      const loginMsg =
+        authErr?.message ||
+        'Authentication required: Please log in to your account to test this agent.';
+      console.error('[Test Agent] zivofy_ai auth error:', {
+        status: 401,
+        message: loginMsg,
+      });
+      setSimulatorError({
+        status: 401,
+        message: loginMsg,
+        isAuthRequired: true,
+      });
+      return;
+    }
+
+    // 2. Resolve verified workspace_id and agent_id
+    let workspace_id = '';
+    let agent_id = '';
+    try {
+      const resolved = await resolveKnowledgeWorkspaceAndAgent();
+      workspace_id = resolved.workspaceId;
+      agent_id = resolved.agentId;
+    } catch (resolveErr: any) {
+      const errMsg =
+        resolveErr?.message ||
+        'Please save and create this agent before testing it.';
+      setSimulatorError({ status: 400, message: errMsg });
+      return;
+    }
 
     setChatInput('');
-    setChatMessages((prev) => [
-      ...prev,
-      { id: customerMsgId, role: 'customer', text: userText, timestamp: new Date().toISOString() },
-    ]);
     setIsWaitingReply(true);
 
-    try {
-      const res = await apiFetch('/api/simulator/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          agentId: agent?.id || 'new-preview',
-          customerMessage: userText,
-          agentOverrides: {
-            name,
-            roleAndDuties,
-            openingLine,
-            tone,
-            knowledgeDocs: docs,
-            tools: {
-              googleSheet: sheetToolConfig,
-              notifications: notificationsConfig,
-            },
-          },
-        }),
-      });
+    let activeConvId =
+      simulatorConversationId && isValidUuid(simulatorConversationId)
+        ? simulatorConversationId
+        : null;
 
-      if (res.ok) {
-        const data = await res.json();
-        setChatMessages((prev) => [
-          ...prev,
-          {
-            id: agentMsgId,
-            role: 'agent',
-            text: data.reply || 'Thank you for reaching out.',
-            timestamp: new Date().toISOString(),
-          },
-        ]);
-      } else {
-        setChatMessages((prev) => [
-          ...prev,
-          {
-            id: agentMsgId,
-            role: 'agent',
-            text: 'I am here to help you. (Simulated response)',
-            timestamp: new Date().toISOString(),
-          },
+    const currentTurnBaseSeq = chatMessages.length + 1;
+    const tempCustomerMsgId = `cust-${Date.now()}`;
+    const userClientMsgId = `cust-${agent_id}-${Date.now()}`;
+    const tempAgentMsgId = `agent-${Date.now() + 1}`;
+
+    // Add optimistic user message with 'saving' status (not marked persisted until Supabase confirms)
+    setChatMessages((prev) => [
+      ...prev,
+      {
+        id: tempCustomerMsgId,
+        clientMessageId: userClientMsgId,
+        sequence: currentTurnBaseSeq,
+        role: 'customer',
+        text: message,
+        timestamp: new Date().toISOString(),
+        saveStatus: 'saving',
+      },
+    ]);
+    scrollTestChatToBottom();
+
+    try {
+      // 3. Ensure a persistent test conversation exists in `public.conversations`
+      if (!activeConvId) {
+        const createdConv = await createSupabaseTestConversation({
+          workspaceId: workspace_id,
+          agentId: agent_id,
+          title: message.slice(0, 60),
+        });
+        activeConvId = createdConv.id;
+        setSimulatorConversationId(createdConv.id);
+        setTestConversations((prev) => [
+          createdConv,
+          ...prev.filter((c) => c.id !== createdConv.id),
         ]);
       }
-    } catch {
+
+      // 4. Persist the user's message in `public.messages` BEFORE treating it as saved
+      let savedUserMsg: AgentTestMessageRecord;
+      try {
+        savedUserMsg = await saveSupabaseTestMessage({
+          workspaceId: workspace_id,
+          agentId: agent_id,
+          conversationId: activeConvId,
+          sender: 'customer',
+          content: message,
+          clientMessageId: userClientMsgId,
+          sequence: currentTurnBaseSeq,
+        });
+      } catch (userSaveErr: any) {
+        const saveErrMsg =
+          userSaveErr?.message ||
+          'Failed to save user message to Supabase. Click Retry on the message to try again.';
+        setChatMessages((prev) =>
+          prev.map((m) =>
+            m.id === tempCustomerMsgId
+              ? { ...m, saveStatus: 'failed', saveError: saveErrMsg }
+              : m
+          )
+        );
+        setSimulatorError({ status: 'DB_SAVE_ERROR', message: saveErrMsg });
+        return;
+      }
+
+      // Confirm user message persistence in UI state and conversation history
+      setChatMessages((prev) =>
+        prev.map((m) =>
+          m.id === tempCustomerMsgId
+            ? {
+                ...m,
+                id: savedUserMsg.id,
+                dbMessageId: savedUserMsg.id,
+                timestamp: savedUserMsg.created_at,
+                saveStatus: 'saved',
+              }
+            : m
+        )
+      );
+
+      setTestConversations((prev) => {
+        const updatedList = prev.map((conv) => {
+          if (conv.id !== activeConvId) return conv;
+          const exists = conv.messages.some((m) => m.id === savedUserMsg.id);
+          const nextMsgs = exists
+            ? conv.messages
+            : [...conv.messages, savedUserMsg];
+          const nextTitle =
+            conv.title === 'New Test Conversation' || !conv.title
+              ? message.length > 56
+                ? `${message.slice(0, 56)}…`
+                : message
+              : conv.title;
+          return {
+            ...conv,
+            title: nextTitle,
+            last_message_at: savedUserMsg.created_at,
+            last_message_text: savedUserMsg.content,
+            message_count: nextMsgs.length,
+            messages: nextMsgs,
+          };
+        });
+        return updatedList;
+      });
+
+      // 5. Invoke the deployed Edge Function with action: "chat" using the verified authenticated session JWT
+      const chatRequestBody: {
+        action: 'chat';
+        workspace_id: string;
+        agent_id: string;
+        message: string;
+        conversation_id: string;
+      } = {
+        action: 'chat',
+        workspace_id,
+        agent_id,
+        message,
+        conversation_id: activeConvId,
+      };
+
+      const { data, error } = await supabase.functions.invoke('zivofy_ai', {
+        body: chatRequestBody,
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+      });
+
+      if (error) {
+        const diag = await extractEdgeFunctionDiagnosticError(error);
+        console.error('[Test Agent] zivofy_ai error:', {
+          status: diag.status,
+          stage: diag.stage || 'edge_function',
+          message: diag.formatted,
+        });
+
+        setSimulatorError({ status: diag.status, message: diag.formatted });
+        setChatMessages((prev) => [
+          ...prev,
+          {
+            id: tempAgentMsgId,
+            role: 'agent',
+            text: diag.formatted,
+            timestamp: new Date().toISOString(),
+            isError: true,
+            errorStatus: diag.status,
+          },
+        ]);
+        return;
+      }
+
+      if (
+        data &&
+        typeof data === 'object' &&
+        (('error' in data && data.error) || data.ok === false || data.success === false)
+      ) {
+        const status =
+          (data as any).status_code ||
+          (data as any).statusCode ||
+          (data as any).httpStatus ||
+          (typeof (data as any).status === 'number' ? (data as any).status : 400);
+        const stage = (data as any).stage ? ` [${(data as any).stage}]` : '';
+        const rawErr =
+          (data as any).error ||
+          (data as any).message ||
+          (data as any).details ||
+          'Edge Function returned an error.';
+        const errDetail =
+          typeof rawErr === 'string'
+            ? rawErr
+            : JSON.stringify(rawErr, null, 2);
+        const errMessage = errDetail.startsWith('HTTP ')
+          ? errDetail
+          : `HTTP ${status}${stage}: ${errDetail}`;
+
+        setSimulatorError({ status, message: errMessage });
+        setChatMessages((prev) => [
+          ...prev,
+          {
+            id: tempAgentMsgId,
+            role: 'agent',
+            text: errMessage,
+            timestamp: new Date().toISOString(),
+            isError: true,
+            errorStatus: status,
+          },
+        ]);
+        return;
+      }
+
+      const rawMsgId = data?.message_id || data?.messageId;
+      const edgeDbMessageId =
+        typeof rawMsgId === 'string' && isValidUuid(rawMsgId)
+          ? rawMsgId.trim()
+          : null;
+
+      const answer = data?.answer;
+      if (typeof answer !== 'string' || !answer.trim()) {
+        const missingMsg =
+          'HTTP 502 [chat_response]: Edge Function responded without a valid data.answer field.';
+        setSimulatorError({ status: 502, message: missingMsg });
+        setChatMessages((prev) => [
+          ...prev,
+          {
+            id: tempAgentMsgId,
+            role: 'agent',
+            text: missingMsg,
+            timestamp: new Date().toISOString(),
+            isError: true,
+            errorStatus: 502,
+          },
+        ]);
+        return;
+      }
+
+      const agentClientMsgId = `agent-reply-${savedUserMsg.id}`;
+      const agentSeq = currentTurnBaseSeq + 1;
+
+      // Display the AI response with 'saving' status while persisting to Supabase
       setChatMessages((prev) => [
         ...prev,
         {
-          id: agentMsgId,
+          id: tempAgentMsgId,
+          dbMessageId: edgeDbMessageId,
+          clientMessageId: agentClientMsgId,
+          sequence: agentSeq,
           role: 'agent',
-          text: 'Thank you for reaching out! How can I assist you further?',
+          text: answer.trim(),
           timestamp: new Date().toISOString(),
+          saveStatus: 'saving',
+        },
+      ]);
+      scrollTestChatToBottom();
+
+      // 6. Persist the AI-generated response in `public.messages` under the same conversation_id
+      try {
+        const savedAgentMsg = await saveSupabaseTestMessage({
+          workspaceId: workspace_id,
+          agentId: agent_id,
+          conversationId: activeConvId,
+          sender: 'agent',
+          content: answer.trim(),
+          clientMessageId: agentClientMsgId,
+          sequence: agentSeq,
+          existingDbMessageId: edgeDbMessageId,
+        });
+
+        setChatMessages((prev) =>
+          prev.map((m) =>
+            m.id === tempAgentMsgId
+              ? {
+                  ...m,
+                  id: savedAgentMsg.id,
+                  dbMessageId: savedAgentMsg.id,
+                  timestamp: savedAgentMsg.created_at,
+                  saveStatus: 'saved',
+                }
+              : m
+          )
+        );
+
+        setTestConversations((prev) => {
+          const updated = prev.map((conv) => {
+            if (conv.id !== activeConvId) return conv;
+            const exists = conv.messages.some(
+              (m) => m.id === savedAgentMsg.id
+            );
+            const nextMsgs = exists
+              ? conv.messages
+              : [...conv.messages, savedAgentMsg];
+            return {
+              ...conv,
+              last_message_at: savedAgentMsg.created_at,
+              last_message_text: savedAgentMsg.content,
+              message_count: nextMsgs.length,
+              messages: nextMsgs,
+            };
+          });
+          // Keep most recently active conversation at top of history list
+          return [...updated].sort(
+            (a, b) =>
+              new Date(b.last_message_at).getTime() -
+              new Date(a.last_message_at).getTime()
+          );
+        });
+      } catch (agentSaveErr: any) {
+        const saveErrMsg =
+          agentSaveErr?.message ||
+          'Agent replied, but saving the response to Supabase failed. Click Retry Save below the response.';
+        setChatMessages((prev) =>
+          prev.map((m) =>
+            m.id === tempAgentMsgId
+              ? { ...m, saveStatus: 'failed', saveError: saveErrMsg }
+              : m
+          )
+        );
+        setSimulatorError({ status: 'DB_SAVE_ERROR', message: saveErrMsg });
+      }
+    } catch (err: any) {
+      const status = err?.status || 'NETWORK_ERROR';
+      const errMsg =
+        err?.message || 'Unexpected error calling zivofy_ai Edge Function.';
+      console.error('[Test Agent] zivofy_ai exception:', {
+        status,
+        message: errMsg,
+      });
+      setSimulatorError({ status, message: errMsg });
+      setChatMessages((prev) => [
+        ...prev,
+        {
+          id: tempAgentMsgId,
+          role: 'agent',
+          text: errMsg,
+          timestamp: new Date().toISOString(),
+          isError: true,
+          errorStatus: status,
         },
       ]);
     } finally {
       setIsWaitingReply(false);
+      scrollTestChatToBottom();
     }
   };
 
@@ -831,12 +2082,13 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
               </p>
             </div>
 
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
               {[
-                { id: 'instagram' as PlatformType, name: 'Instagram', icon: Instagram, color: 'text-[#E1306C]' },
-                { id: 'messenger' as PlatformType, name: 'Facebook', icon: Facebook, color: 'text-[#0866FF]' },
                 { id: 'whatsapp' as PlatformType, name: 'WhatsApp', icon: Phone, color: 'text-[#25D366]' },
-                { id: 'call' as PlatformType, name: 'Phone Calls', icon: PhoneCall, color: 'text-amber-500' },
+                { id: 'instagram' as PlatformType, name: 'Instagram', icon: Instagram, color: 'text-[#E1306C]' },
+                { id: 'tiktok' as PlatformType, name: 'TikTok', icon: TikTokLogo, color: 'text-foreground' },
+                { id: 'call' as PlatformType, name: 'Phone call', icon: PhoneCall, color: 'text-amber-500' },
+                { id: 'messenger' as PlatformType, name: 'Messenger', icon: Facebook, color: 'text-[#0866FF]' },
               ].map((item) => {
                 const isSelected = (platforms || []).includes(item.id);
                 const Icon = item.icon;
@@ -884,6 +2136,8 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
         <div className="space-y-6">
           <GoogleWorkspaceSection
             value={googleWorkspaceConfig}
+            workspaceId={verifiedWorkspaceId || agent?.workspaceId || null}
+            agentId={!isNewAgent ? agent?.id || null : null}
             onChange={(updated) => {
               setGoogleWorkspaceConfig(updated);
               if (updated.sheets) {
@@ -1128,18 +2382,32 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
                       <button
                         type="button"
                         onClick={handleResetUploadedFile}
-                        className="px-3.5 py-2 text-xs font-semibold text-muted-foreground hover:text-foreground rounded-xl transition-colors cursor-pointer"
+                        disabled={isSavingDoc}
+                        className="px-3.5 py-2 text-xs font-semibold text-muted-foreground hover:text-foreground rounded-xl transition-colors disabled:opacity-50 cursor-pointer"
                       >
                         Cancel
                       </button>
                       <button
                         type="button"
                         onClick={handleAddUploadedDoc}
-                        disabled={isReadingFile || (!docContent.trim() && !extractedDoc?.content?.trim())}
+                        disabled={
+                          isSavingDoc ||
+                          isReadingFile ||
+                          (!docContent.trim() && !extractedDoc?.content?.trim())
+                        }
                         className="rounded-xl bg-primary px-5 py-2 text-xs font-semibold text-primary-foreground hover:opacity-95 transition-opacity disabled:opacity-50 flex items-center gap-1.5 shadow-xs cursor-pointer"
                       >
-                        <Plus className="size-3.5" />
-                        <span>Add Document to Knowledge Base</span>
+                        {isSavingDoc ? (
+                          <>
+                            <Loader2 className="size-3.5 animate-spin" />
+                            <span>Saving to Database...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Plus className="size-3.5" />
+                            <span>Add Document to Knowledge Base</span>
+                          </>
+                        )}
                       </button>
                     </div>
                   </div>
@@ -1158,8 +2426,12 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
                     type="text"
                     placeholder="e.g. Return Policy, Pricing Guide, FAQ"
                     value={docTitle}
-                    onChange={(e) => setDocTitle(e.target.value)}
-                    className="w-full rounded-xl border border-border bg-background px-3.5 py-2.5 text-xs text-foreground placeholder:text-muted-foreground focus:border-primary focus:outline-none shadow-2xs"
+                    onChange={(e) => {
+                      setDocTitle(e.target.value);
+                      if (knowledgeError) setKnowledgeError(null);
+                    }}
+                    disabled={isSavingDoc}
+                    className="w-full rounded-xl border border-border bg-background px-3.5 py-2.5 text-xs text-foreground placeholder:text-muted-foreground focus:border-primary focus:outline-none shadow-2xs disabled:opacity-60"
                   />
                 </div>
 
@@ -1171,8 +2443,12 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
                     rows={4}
                     placeholder="Enter detailed instructions, policies, prices, product descriptions, or answers..."
                     value={docContent}
-                    onChange={(e) => setDocContent(e.target.value)}
-                    className="w-full rounded-xl border border-border bg-background p-3.5 text-xs text-foreground placeholder:text-muted-foreground focus:border-primary focus:outline-none shadow-2xs leading-relaxed"
+                    onChange={(e) => {
+                      setDocContent(e.target.value);
+                      if (knowledgeError) setKnowledgeError(null);
+                    }}
+                    disabled={isSavingDoc}
+                    className="w-full rounded-xl border border-border bg-background p-3.5 text-xs text-foreground placeholder:text-muted-foreground focus:border-primary focus:outline-none shadow-2xs leading-relaxed disabled:opacity-60"
                   />
                 </div>
 
@@ -1180,13 +2456,45 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
                   <button
                     type="button"
                     onClick={handleAddDoc}
-                    disabled={!docTitle.trim() || !docContent.trim()}
+                    disabled={isSavingDoc || !docTitle.trim() || !docContent.trim()}
                     className="rounded-xl bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground hover:opacity-95 transition-opacity disabled:opacity-50 flex items-center gap-1.5 shadow-xs cursor-pointer"
                   >
-                    <Plus className="size-3.5" />
-                    <span>Add to Knowledge Base</span>
+                    {isSavingDoc ? (
+                      <>
+                        <Loader2 className="size-3.5 animate-spin" />
+                        <span>Saving to Database...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Plus className="size-3.5" />
+                        <span>Add to Knowledge Base</span>
+                      </>
+                    )}
                   </button>
                 </div>
+              </div>
+            )}
+
+            {/* Database Insertion Error Banner */}
+            {knowledgeError && (
+              <div className="flex items-start justify-between gap-3 rounded-xl border border-destructive/30 bg-destructive/10 p-3.5 text-xs text-destructive">
+                <div className="flex items-start gap-2.5">
+                  <AlertCircle className="size-4 shrink-0 mt-0.5" />
+                  <div className="space-y-0.5">
+                    <p className="font-semibold">Failed to save knowledge document</p>
+                    <p className="text-destructive/90 leading-relaxed break-words">
+                      {knowledgeError}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setKnowledgeError(null)}
+                  className="p-1 rounded-lg hover:bg-destructive/15 transition-colors shrink-0 cursor-pointer"
+                  title="Dismiss error"
+                >
+                  <X className="size-3.5" />
+                </button>
               </div>
             )}
           </div>
@@ -1202,39 +2510,106 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
               </div>
             ) : (
               <div className="grid gap-3">
-                {docs.map((doc) => (
-                  <div
-                    key={doc.id}
-                    className="flex items-start justify-between gap-3 p-4 rounded-2xl border border-border bg-card shadow-xs group"
-                  >
-                    <div className="flex items-start gap-3 min-w-0">
-                      <div className="flex size-9 items-center justify-center rounded-xl bg-primary/10 text-primary shrink-0 ring-1 ring-primary/20">
-                        <FileText className="size-4" />
-                      </div>
-                      <div className="space-y-1 min-w-0">
-                        <div className="flex items-center gap-2">
-                          <span className="text-sm font-bold text-foreground truncate block">
-                            {doc.name}
-                          </span>
-                          <span className="text-[10px] uppercase font-bold px-1.5 py-0.5 rounded bg-muted text-muted-foreground border border-border shrink-0">
-                            {doc.fileSize || `${Math.max(1, Math.round(doc.content.length / 1024))} KB`}
-                          </span>
+                {docs.map((doc) => {
+                  const isDocProcessing =
+                    doc.status === 'processing' || processingDocIds.includes(doc.id);
+                  const isDocReady = doc.status === 'ready' && (doc.chunkCount ?? 0) > 0;
+                  const isDocFailed = doc.status === 'failed';
+                  const statusLabel = isDocProcessing
+                    ? 'Processing'
+                    : isDocReady
+                    ? 'Ready'
+                    : isDocFailed
+                    ? 'Failed'
+                    : 'Queued';
+
+                  return (
+                    <div
+                      key={doc.id}
+                      className="flex items-start justify-between gap-3 p-4 rounded-2xl border border-border bg-card shadow-xs group"
+                    >
+                      <div className="flex items-start gap-3 min-w-0 flex-1">
+                        <div className="flex size-9 items-center justify-center rounded-xl bg-primary/10 text-primary shrink-0 ring-1 ring-primary/20">
+                          <FileText className="size-4" />
                         </div>
-                        <p className="text-xs text-muted-foreground line-clamp-2 leading-relaxed">
-                          {doc.content}
-                        </p>
+                        <div className="space-y-1.5 min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="text-sm font-bold text-foreground truncate block">
+                              {doc.name}
+                            </span>
+                            <span className="text-[10px] uppercase font-bold px-1.5 py-0.5 rounded bg-muted text-muted-foreground border border-border shrink-0">
+                              {doc.fileSize ||
+                                `${Math.max(1, Math.round(doc.content.length / 1024))} KB`}
+                            </span>
+                            {doc.sourceType && (
+                              <span className="text-[10px] uppercase font-bold px-1.5 py-0.5 rounded bg-muted/60 text-muted-foreground border border-border shrink-0">
+                                {doc.sourceType}
+                              </span>
+                            )}
+                            {isDocReady && (
+                              <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-primary/10 text-primary border border-primary/20 shrink-0">
+                                {doc.chunkCount} {doc.chunkCount === 1 ? 'chunk' : 'chunks'}
+                              </span>
+                            )}
+                            <span
+                              className={`inline-flex items-center gap-1 text-[10px] uppercase font-bold px-1.5 py-0.5 rounded border shrink-0 ${
+                                isDocReady
+                                  ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/20'
+                                  : isDocFailed
+                                  ? 'bg-destructive/10 text-destructive border-destructive/20'
+                                  : 'bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/20'
+                              }`}
+                            >
+                              {isDocProcessing && (
+                                <Loader2 className="size-2.5 animate-spin" />
+                              )}
+                              <span>{statusLabel}</span>
+                            </span>
+                          </div>
+                          <p className="text-xs text-muted-foreground line-clamp-2 leading-relaxed">
+                            {doc.content}
+                          </p>
+                          {isDocFailed && doc.errorMessage && (
+                            <p className="text-[11px] text-destructive font-medium leading-snug pt-0.5">
+                              Error: {doc.errorMessage}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {(!isDocReady || isDocFailed) && (
+                          <button
+                            type="button"
+                            onClick={() => handleRetryProcessDoc(doc.id)}
+                            disabled={isDocProcessing || deletingDocId === doc.id}
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-primary/10 text-primary hover:bg-primary/20 transition-colors disabled:opacity-50 cursor-pointer"
+                            title="Process chunks and generate embeddings"
+                          >
+                            <RefreshCw
+                              className={`size-3.5 ${
+                                isDocProcessing ? 'animate-spin' : ''
+                              }`}
+                            />
+                            <span>{isDocFailed ? 'Retry' : 'Process'}</span>
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteDoc(doc.id)}
+                          disabled={deletingDocId === doc.id || isDocProcessing}
+                          className="p-1.5 rounded-lg text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors shrink-0 disabled:opacity-50 cursor-pointer"
+                          title="Delete document"
+                        >
+                          {deletingDocId === doc.id ? (
+                            <Loader2 className="size-4 animate-spin" />
+                          ) : (
+                            <Trash2 className="size-4" />
+                          )}
+                        </button>
                       </div>
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => handleDeleteDoc(doc.id)}
-                      className="p-1.5 rounded-lg text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors shrink-0 cursor-pointer"
-                      title="Delete document"
-                    >
-                      <Trash2 className="size-4" />
-                    </button>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>
@@ -1448,41 +2823,210 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
         </div>
       )}
 
-      {/* Tab: Try it */}
+      {/* Tab: Try it (Test Agent) */}
       {activeTab === 'try' && (
         <div className="space-y-4">
           <div className="surface-card rounded-2xl border border-border bg-card p-6 shadow-xs space-y-4">
+            {/* Header & New Conversation Action */}
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border pb-3">
               <div>
-                <h3 className="text-base font-bold text-foreground">Agent Simulator</h3>
+                <div className="flex items-center gap-2">
+                  <h3 className="text-base font-bold text-foreground">
+                    Agent Simulator
+                  </h3>
+                  {simulatorConversationId && (
+                    <span
+                      className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-muted text-muted-foreground border border-border"
+                      title={`Active Conversation ID: ${simulatorConversationId}`}
+                    >
+                      #{simulatorConversationId.slice(0, 8)}
+                    </span>
+                  )}
+                </div>
                 <p className="text-xs text-muted-foreground mt-0.5">
-                  Test your agent. Hover over any agent reply to rate with stars and submit feedback or improvement suggestions.
+                  Test your agent. All conversations and messages are saved permanently in Supabase. Hover over any agent reply to rate and submit feedback.
                 </p>
               </div>
 
-              <button
-                type="button"
-                onClick={handleClearChat}
-                className="text-xs text-muted-foreground hover:text-foreground font-medium rounded-lg px-2.5 py-1.5 border border-border bg-background hover:bg-accent transition-colors cursor-pointer"
-              >
-                Reset chat
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  id="test-agent-new-conversation-btn"
+                  disabled={isCreatingConversation || isWaitingReply || isNewAgent}
+                  onClick={handleStartNewConversation}
+                  className="inline-flex items-center gap-1.5 text-xs font-semibold rounded-xl px-3.5 py-2 bg-primary text-primary-foreground hover:opacity-95 disabled:opacity-50 transition-opacity shadow-xs cursor-pointer"
+                >
+                  {isCreatingConversation ? (
+                    <>
+                      <Loader2 className="size-3.5 animate-spin" />
+                      <span>Starting…</span>
+                    </>
+                  ) : (
+                    <>
+                      <Plus className="size-3.5" />
+                      <span>New Conversation</span>
+                    </>
+                  )}
+                </button>
+              </div>
             </div>
 
+            {/* Saved Test Conversations History Selector */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5 text-xs font-semibold text-muted-foreground">
+                  <History className="size-3.5 text-primary" />
+                  <span>
+                    Saved Test Conversations ({testConversations.length})
+                  </span>
+                </div>
+                {isLoadingTestHistory && (
+                  <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
+                    <Loader2 className="size-3 animate-spin" />
+                    <span>Syncing history…</span>
+                  </span>
+                )}
+              </div>
+
+              {testConversations.length > 0 ? (
+                <div className="flex items-center gap-2 overflow-x-auto pb-1.5">
+                  {testConversations.map((conv, idx) => {
+                    const isSelected = conv.id === simulatorConversationId;
+                    const formattedDate = new Date(
+                      conv.last_message_at || conv.created_at
+                    ).toLocaleString([], {
+                      month: 'short',
+                      day: 'numeric',
+                      hour: '2-digit',
+                      minute: '2-digit',
+                    });
+
+                    return (
+                      <button
+                        key={conv.id}
+                        type="button"
+                        onClick={() => handleSelectTestConversation(conv.id)}
+                        disabled={isWaitingReply || isCreatingConversation}
+                        className={`group flex flex-col items-start gap-1 rounded-xl border px-3 py-2 text-left transition-all shrink-0 max-w-[230px] cursor-pointer ${
+                          isSelected
+                            ? 'border-primary bg-primary/10 text-foreground shadow-2xs'
+                            : 'border-border bg-background/70 text-muted-foreground hover:border-primary/40 hover:text-foreground'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2 w-full">
+                          <span className="text-xs font-semibold truncate max-w-[145px]">
+                            {conv.title || `Conversation #${testConversations.length - idx}`}
+                          </span>
+                          <span
+                            className={`text-[10px] px-1.5 py-0.2 rounded-md font-medium shrink-0 ${
+                              isSelected
+                                ? 'bg-primary text-primary-foreground'
+                                : 'bg-muted text-muted-foreground'
+                            }`}
+                          >
+                            {conv.message_count}{' '}
+                            {conv.message_count === 1 ? 'msg' : 'msgs'}
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between gap-2 w-full text-[10px] text-muted-foreground">
+                          <span className="font-mono">
+                            #{conv.id.slice(0, 6)}
+                          </span>
+                          <span>{formattedDate}</span>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : (
+                !isLoadingTestHistory && (
+                  <div className="rounded-xl border border-dashed border-border bg-muted/15 px-3.5 py-2 text-[11px] text-muted-foreground">
+                    No saved test conversations for this agent yet. Send a message below or click <span className="font-semibold text-foreground">New Conversation</span> to begin.
+                  </div>
+                )
+              )}
+            </div>
+
+            {simulatorError && (
+              <div className="rounded-xl border border-destructive/30 bg-destructive/10 p-3.5 text-xs text-destructive space-y-1.5">
+                <div className="font-semibold flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5">
+                    <AlertCircle className="size-3.5 shrink-0" />
+                    <span>
+                      {simulatorError.isAuthRequired
+                        ? 'Login Required'
+                        : `Test Agent Error${
+                            simulatorError.status !== undefined
+                              ? ` (Status: ${simulatorError.status})`
+                              : ''
+                          }`}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {simulatorError.isAuthRequired && (
+                      <button
+                        type="button"
+                        onClick={() => onNavigate('/auth')}
+                        className="rounded-lg bg-destructive text-white px-2.5 py-1 text-[11px] font-semibold hover:opacity-90 transition-opacity cursor-pointer"
+                      >
+                        Log in
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setSimulatorError(null)}
+                      className="p-1 rounded-lg hover:bg-destructive/15 transition-colors cursor-pointer"
+                      title="Dismiss error"
+                    >
+                      <X className="size-3.5" />
+                    </button>
+                  </div>
+                </div>
+                <pre className="whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed">
+                  {simulatorError.message}
+                </pre>
+              </div>
+            )}
+
             {/* Chat Box */}
-            <div className="h-96 overflow-y-auto rounded-xl border border-border bg-muted/15 p-4 space-y-4">
-              {chatMessages.map((msg) => (
-                <SimulatorMessageBubble
-                  key={msg.id}
-                  message={msg}
-                  onUpdateFeedback={handleUpdateFeedback}
-                />
-              ))}
+            <div
+              ref={chatScrollContainerRef}
+              className="h-96 overflow-y-auto rounded-xl border border-border bg-muted/15 p-4 space-y-4"
+            >
+              {isLoadingTestHistory && chatMessages.length === 0 ? (
+                <div className="h-full flex flex-col items-center justify-center text-center gap-2 text-xs text-muted-foreground">
+                  <Loader2 className="size-5 text-primary animate-spin" />
+                  <span>Loading saved test conversation from Supabase…</span>
+                </div>
+              ) : chatMessages.length === 0 ? (
+                <div className="h-full flex flex-col items-center justify-center text-center px-4 space-y-2">
+                  <div className="flex size-10 items-center justify-center rounded-2xl bg-primary/10 text-primary">
+                    <MessageSquare className="size-5" />
+                  </div>
+                  <p className="text-xs font-semibold text-foreground">
+                    {simulatorConversationId
+                      ? 'New test conversation started'
+                      : 'Start testing your AI agent'}
+                  </p>
+                  <p className="text-xs text-muted-foreground max-w-sm leading-relaxed">
+                    Send a message below to test {name || 'your agent'}. Every user message and AI response in this conversation will be saved permanently in Supabase.
+                  </p>
+                </div>
+              ) : (
+                chatMessages.map((msg) => (
+                  <SimulatorMessageBubble
+                    key={msg.id}
+                    message={msg}
+                    onUpdateFeedback={handleUpdateFeedback}
+                    onRetrySaveMessage={handleRetrySaveMessage}
+                  />
+                ))
+              )}
 
               {isWaitingReply && (
                 <div className="flex justify-start">
-                  <div className="rounded-2xl rounded-tl-none bg-card border border-border px-4 py-2.5 text-xs text-muted-foreground animate-pulse shadow-xs flex items-center gap-1.5">
-                    <Bot className="size-3.5 text-primary" />
+                  <div className="rounded-2xl rounded-tl-none bg-card border border-border px-4 py-2.5 text-xs text-muted-foreground shadow-xs flex items-center gap-2">
+                    <Loader2 className="size-3.5 text-primary animate-spin shrink-0" />
                     <span>Agent is generating response…</span>
                   </div>
                 </div>
@@ -1493,18 +3037,30 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
             <form onSubmit={handleSimulateChat} className="flex gap-2">
               <input
                 type="text"
+                disabled={isWaitingReply || isCreatingConversation}
                 placeholder="Ask a question, request price, or test your agent's knowledge..."
                 value={chatInput}
                 onChange={(e) => setChatInput(e.target.value)}
-                className="flex-1 rounded-xl border border-border bg-background px-3.5 py-2.5 text-xs text-foreground placeholder:text-muted-foreground focus:border-primary focus:outline-none shadow-2xs"
+                className="flex-1 rounded-xl border border-border bg-background px-3.5 py-2.5 text-xs text-foreground placeholder:text-muted-foreground focus:border-primary focus:outline-none shadow-2xs disabled:opacity-50"
               />
               <button
                 type="submit"
-                disabled={!chatInput.trim() || isWaitingReply}
+                disabled={
+                  !chatInput.trim() || isWaitingReply || isCreatingConversation
+                }
                 className="rounded-xl bg-primary px-4 py-2.5 text-xs font-semibold text-primary-foreground hover:opacity-95 transition-opacity disabled:opacity-50 flex items-center gap-1.5 shadow-xs cursor-pointer"
               >
-                <Send className="size-3.5" />
-                <span>Send</span>
+                {isWaitingReply ? (
+                  <>
+                    <Loader2 className="size-3.5 animate-spin" />
+                    <span>Sending…</span>
+                  </>
+                ) : (
+                  <>
+                    <Send className="size-3.5" />
+                    <span>Send</span>
+                  </>
+                )}
               </button>
             </form>
           </div>

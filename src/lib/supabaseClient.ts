@@ -1,8 +1,16 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
-// Retrieve Vite environment variables for Supabase
-const rawUrl = (import.meta.env.VITE_SUPABASE_URL as string | undefined)?.trim() || '';
-const rawAnonKey = (import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined)?.trim() || '';
+const DEFAULT_SUPABASE_URL = 'https://epmrelszczsxirbansrl.supabase.co';
+const DEFAULT_SUPABASE_ANON_KEY =
+  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVwbXJlbHN6Y3pzeGlyYmFuc3JsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTE2Njg1NTAsImV4cCI6MjEwNzI0NDU1MH0.bdX8BNClNXK-62aArOaYa9m7UIDIzjuVtuIDfr0zSWY';
+
+// Retrieve Vite environment variables for Supabase with real project fallback
+const rawUrl =
+  (import.meta.env.VITE_SUPABASE_URL as string | undefined)?.trim() ||
+  DEFAULT_SUPABASE_URL;
+const rawAnonKey =
+  (import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined)?.trim() ||
+  DEFAULT_SUPABASE_ANON_KEY;
 
 // Normalize URL: Strip accidental /rest/v1/ or trailing slash
 export function normalizeSupabaseUrl(url: string): string {
@@ -17,9 +25,9 @@ export const SUPABASE_ANON_KEY = rawAnonKey;
 
 export const isSupabaseConfigured: boolean = Boolean(
   SUPABASE_URL &&
-  SUPABASE_ANON_KEY &&
-  !SUPABASE_URL.includes('MY_SUPABASE_URL') &&
-  !SUPABASE_ANON_KEY.includes('MY_SUPABASE_ANON_KEY')
+    SUPABASE_ANON_KEY &&
+    !SUPABASE_URL.includes('MY_SUPABASE_URL') &&
+    !SUPABASE_ANON_KEY.includes('MY_SUPABASE_ANON_KEY')
 );
 
 // Instantiate singleton Supabase client
@@ -57,7 +65,7 @@ export interface SupabaseHealthCheckResult {
  * Does not throw, returns structured health status.
  */
 export async function testSupabaseConnection(): Promise<SupabaseHealthCheckResult> {
-  if (!isSupabaseConfigured || !SUPABASE_URL || !SUPABASE_ANON_KEY) {
+  if (!isSupabaseConfigured || !SUPABASE_URL || !SUPABASE_ANON_KEY || !supabase) {
     return {
       isConfigured: false,
       connected: false,
@@ -69,7 +77,7 @@ export async function testSupabaseConnection(): Promise<SupabaseHealthCheckResul
 
   const start = performance.now();
   try {
-    // Query profiles table to verify connectivity and auth
+    // Query profiles table to verify connectivity and RLS
     const { error } = await supabase.from('profiles').select('id').limit(1);
     const latencyMs = Math.round(performance.now() - start);
 
@@ -99,9 +107,10 @@ export async function testSupabaseConnection(): Promise<SupabaseHealthCheckResul
       connected: false,
       url: SUPABASE_URL,
       hasKey: true,
-      error: msg.includes('Failed to fetch') || msg.includes('ENOTFOUND')
-        ? `Cannot reach host (${SUPABASE_URL}). Host may be paused, offline, or DNS unresolvable.`
-        : msg,
+      error:
+        msg.includes('Failed to fetch') || msg.includes('ENOTFOUND')
+          ? `Cannot reach host (${SUPABASE_URL}). Host may be paused, offline, or DNS unresolvable.`
+          : msg,
       latencyMs,
     };
   }

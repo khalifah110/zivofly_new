@@ -25,7 +25,7 @@ export const ConnectChannelPage: React.FC<ConnectChannelPageProps> = ({
 }) => {
   const channel = CHANNELS[channelKey] || CHANNELS.whatsapp;
   const isCall = channel.key === 'call';
-  const isMeta = channel.key === 'instagram' || channel.key === 'messenger';
+  const isMeta = channel.key === 'instagram' || channel.key === 'messenger' || channel.key === 'tiktok';
 
   const [step, setStep] = useState(0);
   const [accountHandle, setAccountHandle] = useState('');
@@ -129,7 +129,7 @@ export const ConnectChannelPage: React.FC<ConnectChannelPageProps> = ({
           agent_id: finalAgentId || null,
           reply_dms: true,
           reply_comments: channel.supportsComments,
-          reply_tags: channel.key === 'instagram',
+          reply_tags: channel.key === 'instagram' || channel.key === 'tiktok',
           comment_keywords: ['price', 'cost', 'hours', 'book'],
           always_on: true,
           meta_oauth_connected: metaOAuthConnected,
@@ -211,6 +211,8 @@ export const ConnectChannelPage: React.FC<ConnectChannelPageProps> = ({
               <label htmlFor="account" className="text-xs font-medium text-foreground">
                 {channel.key === 'instagram'
                   ? 'Instagram username'
+                  : channel.key === 'tiktok'
+                  ? 'TikTok username'
                   : channel.key === 'messenger'
                   ? 'Facebook Page name'
                   : 'Business phone number'}
@@ -221,7 +223,7 @@ export const ConnectChannelPage: React.FC<ConnectChannelPageProps> = ({
                 value={accountHandle}
                 onChange={(e) => setAccountHandle(e.target.value)}
                 placeholder={
-                  channel.key === 'instagram'
+                  channel.key === 'instagram' || channel.key === 'tiktok'
                     ? '@yourbusiness'
                     : channel.key === 'messenger'
                     ? 'Your Business Page'

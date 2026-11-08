@@ -19,6 +19,7 @@ import {
   X,
 } from 'lucide-react';
 import { TIMEZONE_GROUPS } from '../data/timezones';
+import { TikTokLogo } from './BrandLogos';
 
 interface AgentBuilderProps {
   agent: Agent;
@@ -205,12 +206,13 @@ export const AgentBuilder: React.FC<AgentBuilderProps> = ({
           Select which communication channels this agent is authorized to handle.
         </p>
 
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
           {[
-            { id: 'instagram' as PlatformType, name: 'Instagram', icon: Instagram, color: 'text-[#E1306C]' },
             { id: 'whatsapp' as PlatformType, name: 'WhatsApp', icon: Phone, color: 'text-[#25D366]' },
+            { id: 'instagram' as PlatformType, name: 'Instagram', icon: Instagram, color: 'text-[#E1306C]' },
+            { id: 'tiktok' as PlatformType, name: 'TikTok', icon: TikTokLogo, color: 'text-neutral-900' },
+            { id: 'call' as PlatformType, name: 'Phone call', icon: PhoneCall, color: 'text-amber-500' },
             { id: 'messenger' as PlatformType, name: 'Messenger', icon: Facebook, color: 'text-[#0866FF]' },
-            { id: 'call' as PlatformType, name: 'Phone Calls', icon: PhoneCall, color: 'text-amber-500' },
           ].map((item) => {
             const isSelected = (platforms || []).includes(item.id);
             const Icon = item.icon;

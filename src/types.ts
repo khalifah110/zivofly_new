@@ -1,4 +1,4 @@
-export type PlatformType = 'instagram' | 'whatsapp' | 'messenger' | 'call';
+export type PlatformType = 'whatsapp' | 'instagram' | 'tiktok' | 'call' | 'messenger';
 
 export interface User {
   id: string;
@@ -31,6 +31,14 @@ export interface PlatformConfig {
     tagAllowedAccounts: string[]; // e.g. ["all", "@vip_partner"]
     trainedOnBioAndPosts: boolean;
   };
+  // TikTok specific
+  tiktok?: {
+    connected: boolean;
+    username?: string;
+    replyDMs: boolean;
+    replyComments: boolean;
+    trainedOnBioAndPosts?: boolean;
+  };
   // WhatsApp specific
   whatsapp?: {
     connected: boolean;
@@ -58,13 +66,39 @@ export interface PlatformConfig {
   };
 }
 
+export type KnowledgeSourceType =
+  | 'file'
+  | 'text'
+  | 'website'
+  | 'faq'
+  | 'meta_bio'
+  | 'meta_post'
+  | 'conversation'
+  | 'google_doc'
+  | 'other';
+
+export type KnowledgeDocumentStatus =
+  | 'queued'
+  | 'processing'
+  | 'ready'
+  | 'failed'
+  | 'deleted';
+
 export interface KnowledgeDocument {
   id: string;
+  workspaceId?: string;
+  agentId?: string;
   name: string;
   type: 'pdf' | 'text' | 'faq' | 'social_bio';
+  sourceType?: KnowledgeSourceType;
   content: string;
+  mimeType?: string;
+  fileSizeBytes?: number;
   chunkCount: number;
+  status?: KnowledgeDocumentStatus;
+  errorMessage?: string | null;
   createdAt: string;
+  updatedAt?: string;
   fileSize?: string;
 }
 
@@ -78,6 +112,19 @@ export interface GoogleSheetColumn {
 }
 
 export type GoogleSheetRow = Record<string, any>;
+
+export type GoogleWorkspaceServiceIdentifier =
+  | 'gmail'
+  | 'google_drive'
+  | 'google_docs'
+  | 'google_sheets_service'
+  | 'google_calendar';
+
+export type GoogleWorkspaceIntegrationStatus =
+  | 'connected'
+  | 'expired'
+  | 'error'
+  | 'disconnected';
 
 export interface GoogleSheetToolConfig {
   enabled: boolean;
@@ -94,15 +141,20 @@ export interface GoogleSheetToolConfig {
   columns: GoogleSheetColumn[];
   sampleData?: GoogleSheetRow[];
   sampleRows?: GoogleSheetRow[];
+  accountEmail?: string;
+  connectionId?: string;
+  lastError?: string | null;
   connectedAt?: string;
   lastSyncedAt?: string;
-  status?: 'connected' | 'disconnected' | 'syncing';
+  status?: 'connected' | 'disconnected' | 'syncing' | 'expired' | 'error';
 }
 
 export interface GoogleWorkspaceAppConfig {
   enabled: boolean;
-  status: 'connected' | 'disconnected';
+  status: GoogleWorkspaceIntegrationStatus;
   accountEmail?: string;
+  connectionId?: string;
+  lastError?: string | null;
   connectedAt?: string;
   lastSyncedAt?: string;
 }
@@ -231,6 +283,7 @@ export interface CustomVoiceConfig {
 export interface Agent {
   id: string;
   userId: string;
+  workspaceId?: string;
   name: string;
   description: string;
   platforms: PlatformType[];
@@ -260,6 +313,8 @@ export interface ChatMessage {
   referencedMessageIds?: string[]; // IDs of messages referenced (for consecutive queries)
   rating?: number; // 1 to 5
   feedback?: string;
+  feedbackTags?: string[];
+  feedbackId?: string;
   feedbackCreatedAt?: string;
 }
 
@@ -277,6 +332,8 @@ export interface Conversation {
   status: 'agent_active' | 'human_takeover';
   rating?: number; // 1 to 5 stars
   feedbackComment?: string;
+  feedbackTags?: string[];
+  feedbackId?: string;
   messages: ChatMessage[];
   missedMessagesCountWhilePaused?: number;
 }

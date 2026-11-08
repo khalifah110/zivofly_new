@@ -2,6 +2,7 @@ import React, { useState, useRef } from 'react';
 import { Agent, ChatMessage, PlatformType } from '../types';
 import { apiFetch } from '../lib/api';
 import { AgentResponseRating } from './AgentResponseRating';
+import { TikTokLogo } from './BrandLogos';
 import {
   Instagram,
   Phone,
@@ -228,12 +229,13 @@ export const InteractiveSimulator: React.FC<InteractiveSimulatorProps> = ({
         </div>
 
         {/* Channel Selector */}
-        <div className="flex items-center gap-1.5 bg-muted p-1.5 rounded-2xl border border-border">
+        <div className="flex items-center gap-1.5 bg-muted p-1.5 rounded-2xl border border-border flex-wrap">
           {[
-            { id: 'instagram' as PlatformType, name: 'Instagram', icon: Instagram, color: 'text-[#E1306C]' },
             { id: 'whatsapp' as PlatformType, name: 'WhatsApp', icon: Phone, color: 'text-[#25D366]' },
+            { id: 'instagram' as PlatformType, name: 'Instagram', icon: Instagram, color: 'text-[#E1306C]' },
+            { id: 'tiktok' as PlatformType, name: 'TikTok', icon: TikTokLogo, color: 'text-foreground' },
+            { id: 'call' as PlatformType, name: 'Phone call', icon: PhoneCall, color: 'text-amber-500' },
             { id: 'messenger' as PlatformType, name: 'Messenger', icon: Facebook, color: 'text-[#0866FF]' },
-            { id: 'call' as PlatformType, name: 'Phone Call', icon: PhoneCall, color: 'text-amber-500' },
           ].map((item) => {
             const isSelected = platform === item.id;
             const Icon = item.icon;
@@ -443,12 +445,19 @@ export const InteractiveSimulator: React.FC<InteractiveSimulatorProps> = ({
                       messageText={msg.text}
                       rating={msg.rating}
                       feedback={msg.feedback}
+                      feedbackTags={msg.feedbackTags}
                       feedbackCreatedAt={msg.feedbackCreatedAt}
-                      onUpdateFeedback={(msgId, rating, feedback) => {
+                      onUpdateFeedback={(msgId, rating, feedback, tags) => {
                         setMessages((prev) =>
                           prev.map((m) =>
                             m.id === msgId
-                              ? { ...m, rating, feedback, feedbackCreatedAt: new Date().toISOString() }
+                              ? {
+                                  ...m,
+                                  rating,
+                                  feedback,
+                                  feedbackTags: tags,
+                                  feedbackCreatedAt: new Date().toISOString(),
+                                }
                               : m
                           )
                         );

@@ -16,14 +16,17 @@ import {
   updateSupabaseConnection,
   deleteSupabaseConnection,
   getSupabaseConversations,
+  createSupabaseConversation,
   sendSupabaseMessage,
+  saveSupabaseConversationFeedback,
+  getSupabaseConversationFeedback,
 } from './supabaseService';
 
 export interface ChannelConnection {
   id: string;
   user_id: string;
   agent_id: string | null;
-  channel: 'whatsapp' | 'instagram' | 'messenger' | 'call';
+  channel: 'whatsapp' | 'instagram' | 'tiktok' | 'call' | 'messenger';
   display_name: string;
   handle: string;
   status: 'connected' | 'disconnected';
@@ -105,6 +108,25 @@ function setStored<T>(key: string, val: T): void {
   } catch (err) {
     console.error('Failed to persist to localStorage', err);
   }
+}
+
+async function resolveCurrentUserId(): Promise<string> {
+  if (isSupabaseConfigured && supabase) {
+    try {
+      const { data: sessionData } = await supabase.auth.getSession();
+      if (sessionData?.session?.user?.id) {
+        return sessionData.session.user.id;
+      }
+      const { data: authData } = await supabase.auth.getUser();
+      if (authData?.user?.id) {
+        return authData.user.id;
+      }
+    } catch {
+      // ignore
+    }
+  }
+  const storedUser = getStored<User | null>(STORAGE_KEYS.USER, null);
+  return storedUser?.id || '';
 }
 
 // Storage initializers
@@ -295,15 +317,16 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
     }
 
     if (method === 'PUT') {
-      const currentUser = getStored<User>(STORAGE_KEYS.USER, null);
+      const currentUser = getStored<User | null>(STORAGE_KEYS.USER, null);
+      const userId = await resolveCurrentUserId();
       let updatedUser: User = {
-        ...(currentUser || { id: '', email: '', name: '', businessName: '' }),
+        ...(currentUser || { id: userId, email: '', name: '', businessName: '' }),
         ...(body || {}),
       };
 
-      if (isSupabaseConfigured && currentUser?.id) {
+      if (isSupabaseConfigured && userId && !userId.startsWith('user_default')) {
         try {
-          const supaUpdated = await updateSupabaseProfile(currentUser.id, updatedUser);
+          const supaUpdated = await updateSupabaseProfile(userId, updatedUser);
           if (supaUpdated) updatedUser = supaUpdated;
         } catch (e) {
           console.warn('[Zivofly] Supabase profile update error:', e);
@@ -321,41 +344,31 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
         if (supaProfile) {
           setStored(STORAGE_KEYS.USER, supaProfile);
           return jsonResponse({ user: supaProfile });
+        } else {
+          localStorage.removeItem(STORAGE_KEYS.USER);
+          return jsonResponse({ user: null });
         }
       } catch (e) {
         console.warn('[Zivofly] Supabase profile get error:', e);
       }
     }
 
-    const user = getStored<User>(STORAGE_KEYS.USER, null);
+    const user = getStored<User | null>(STORAGE_KEYS.USER, null);
     return jsonResponse({ user });
   }
 
   // --- Agents Endpoints ---
   if (pathname === '/api/agents' && method === 'GET') {
-    if (isSupabaseConfigured && supabase) {
+    const userId = await resolveCurrentUserId();
+    if (isSupabaseConfigured && userId && !userId.startsWith('user_default')) {
       try {
-        const { data: authData } = await supabase.auth.getUser();
-        const authUserId = authData?.user?.id;
-        if (authUserId) {
-          const supaAgents = await getSupabaseAgents(authUserId);
-          return jsonResponse({ agents: supaAgents || [] });
-        }
-        return jsonResponse({ agents: [] });
+        const supaAgents = await getSupabaseAgents(userId);
+        const list = supaAgents || [];
+        setStored(STORAGE_KEYS.AGENTS, list);
+        return jsonResponse({ agents: list });
       } catch (e) {
         console.warn('[Zivofly] Supabase agents query failed:', e);
-        return jsonResponse({ agents: [] });
-      }
-    }
-
-    const currentUser = getStored<User>(STORAGE_KEYS.USER, null);
-    if (isSupabaseConfigured && currentUser?.id && !currentUser.id.startsWith('user_default')) {
-      try {
-        const supaAgents = await getSupabaseAgents(currentUser.id);
-        return jsonResponse({ agents: supaAgents || [] });
-      } catch (e) {
-        console.warn('[Zivofly] Supabase agents query failed:', e);
-        return jsonResponse({ agents: [] });
+        return jsonResponse({ agents: getStored<Agent[]>(STORAGE_KEYS.AGENTS, []) });
       }
     }
 
@@ -368,11 +381,11 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
   }
 
   if (pathname === '/api/agents' && method === 'POST') {
-    const currentUser = getStored<User>(STORAGE_KEYS.USER, null);
+    const userId = await resolveCurrentUserId();
 
-    if (isSupabaseConfigured && currentUser?.id) {
+    if (isSupabaseConfigured && userId && !userId.startsWith('user_default')) {
       try {
-        const supaAgent = await createSupabaseAgent(body, currentUser.id);
+        const supaAgent = await createSupabaseAgent(body, userId);
         if (supaAgent) {
           const agents = getStored<Agent[]>(STORAGE_KEYS.AGENTS, []);
           agents.unshift(supaAgent);
@@ -387,7 +400,7 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
     const agents = getStored<Agent[]>(STORAGE_KEYS.AGENTS, []);
     const newAgent: Agent = {
       id: `agent_${Date.now()}`,
-      userId: currentUser?.id || 'user_supabase',
+      userId: userId || 'user_supabase',
       name: body?.name || 'Customer Concierge',
       description: body?.description || 'Automated customer care assistant',
       platforms: body?.platforms || ['instagram', 'whatsapp'],
@@ -499,52 +512,56 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
     }
 
     if (method === 'PUT') {
-      if (idx === -1) return jsonResponse({ error: 'Agent not found' }, 404);
-      let updated = { ...agents[idx], ...body, updatedAt: new Date().toISOString() };
-      const currentUser = getStored<User>(STORAGE_KEYS.USER, DEFAULT_USER);
-      if (isSupabaseConfigured && currentUser.id && !currentUser.id.startsWith('user_default')) {
+      const userId = await resolveCurrentUserId();
+      const baseAgent = idx !== -1 ? agents[idx] : { ...DEFAULT_AGENT, id: agentId };
+      let updated = { ...baseAgent, ...body, updatedAt: new Date().toISOString() };
+      if (isSupabaseConfigured && userId && !userId.startsWith('user_default')) {
         try {
-          const supaAgent = await updateSupabaseAgent(agentId, updated, currentUser.id);
+          const supaAgent = await updateSupabaseAgent(agentId, updated, userId);
           if (supaAgent) updated = supaAgent;
         } catch (e) {
           console.warn('[Zivofly] Supabase agent update error:', e);
         }
       }
-      agents[idx] = updated;
+      if (idx !== -1) {
+        agents[idx] = updated;
+      } else {
+        agents.unshift(updated);
+      }
       setStored(STORAGE_KEYS.AGENTS, agents);
-      return jsonResponse({ agent: agents[idx] });
+      return jsonResponse({ agent: updated });
     }
 
     if (method === 'DELETE') {
       if (idx !== -1) {
         agents.splice(idx, 1);
         setStored(STORAGE_KEYS.AGENTS, agents);
+      }
 
-        if (isSupabaseConfigured) {
-          try {
-            await deleteSupabaseAgent(agentId);
-          } catch (e) {
-            console.warn('[Zivofly] Supabase agent delete error:', e);
-          }
-        }
-
-        // Unlink any connections mapped to this agent
+      if (isSupabaseConfigured) {
         try {
-          const connections = getStored<ChannelConnection[]>(STORAGE_KEYS.CONNECTIONS, DEFAULT_CONNECTIONS);
-          let connsModified = false;
-          connections.forEach((conn) => {
-            if (conn.agent_id === agentId) {
-              conn.agent_id = null;
-              if (conn.agents) delete conn.agents;
-              connsModified = true;
-            }
-          });
-          if (connsModified) {
-            setStored(STORAGE_KEYS.CONNECTIONS, connections);
-          }
+          await deleteSupabaseAgent(agentId);
         } catch (e) {
-          console.error('Failed to unlink connections', e);
+          console.warn('[Zivofly] Supabase agent delete error:', e);
         }
+      }
+
+      // Unlink any connections mapped to this agent
+      try {
+        const connections = getStored<ChannelConnection[]>(STORAGE_KEYS.CONNECTIONS, DEFAULT_CONNECTIONS);
+        let connsModified = false;
+        connections.forEach((conn) => {
+          if (conn.agent_id === agentId) {
+            conn.agent_id = null;
+            if (conn.agents) delete conn.agents;
+            connsModified = true;
+          }
+        });
+        if (connsModified) {
+          setStored(STORAGE_KEYS.CONNECTIONS, connections);
+        }
+      } catch (e) {
+        console.error('Failed to unlink connections', e);
       }
       return jsonResponse({ success: true, message: 'Agent deleted' });
     }
@@ -560,6 +577,14 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
 
     agent.status = agent.status === 'active' ? 'paused' : 'active';
     agent.updatedAt = new Date().toISOString();
+    const userId = await resolveCurrentUserId();
+    if (isSupabaseConfigured && userId && !userId.startsWith('user_default')) {
+      try {
+        await updateSupabaseAgent(agentId, agent, userId);
+      } catch (e) {
+        console.warn('[Zivofly] Supabase toggle status error:', e);
+      }
+    }
     setStored(STORAGE_KEYS.AGENTS, agents);
     return jsonResponse({ agent });
   }
@@ -583,6 +608,17 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
     };
     agent.knowledgeDocs = agent.knowledgeDocs || [];
     agent.knowledgeDocs.push(newDoc);
+    const userId = await resolveCurrentUserId();
+    if (isSupabaseConfigured && userId && !userId.startsWith('user_default')) {
+      try {
+        const supaAgent = await updateSupabaseAgent(agentId, agent, userId);
+        if (supaAgent) {
+          agent.knowledgeDocs = supaAgent.knowledgeDocs;
+        }
+      } catch (e) {
+        console.warn('[Zivofly] Supabase knowledge upload sync error:', e);
+      }
+    }
     setStored(STORAGE_KEYS.AGENTS, agents);
     return jsonResponse({ success: true, doc: newDoc, agent });
   }
@@ -595,6 +631,14 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
     const agent = agents.find(a => a.id === agentId);
     if (agent && agent.knowledgeDocs) {
       agent.knowledgeDocs = agent.knowledgeDocs.filter(d => d.id !== docId);
+      const userId = await resolveCurrentUserId();
+      if (isSupabaseConfigured && userId && !userId.startsWith('user_default')) {
+        try {
+          await updateSupabaseAgent(agentId, agent, userId);
+        } catch (e) {
+          console.warn('[Zivofly] Supabase knowledge delete sync error:', e);
+        }
+      }
       setStored(STORAGE_KEYS.AGENTS, agents);
     }
     return jsonResponse({ success: true, agent });
@@ -602,29 +646,17 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
 
   // --- Connections Endpoints ---
   if (pathname === '/api/connections' && method === 'GET') {
-    if (isSupabaseConfigured && supabase) {
+    const userId = await resolveCurrentUserId();
+    if (isSupabaseConfigured && userId && !userId.startsWith('user_default')) {
       try {
-        const { data: authData } = await supabase.auth.getUser();
-        const authUserId = authData?.user?.id;
-        if (authUserId) {
-          const supaConns = await getSupabaseConnections(authUserId);
-          return jsonResponse({ connections: supaConns || [], data: supaConns || [] });
-        }
-        return jsonResponse({ connections: [], data: [] });
+        const supaConns = await getSupabaseConnections(userId);
+        const list = supaConns || [];
+        setStored(STORAGE_KEYS.CONNECTIONS, list);
+        return jsonResponse({ connections: list, data: list });
       } catch (e) {
         console.warn('[Zivofly] Supabase connections query failed:', e);
-        return jsonResponse({ connections: [], data: [] });
-      }
-    }
-
-    const currentUser = getStored<User>(STORAGE_KEYS.USER, DEFAULT_USER);
-    if (isSupabaseConfigured && currentUser.id && !currentUser.id.startsWith('user_default')) {
-      try {
-        const supaConns = await getSupabaseConnections(currentUser.id);
-        return jsonResponse({ connections: supaConns || [], data: supaConns || [] });
-      } catch (e) {
-        console.warn('[Zivofly] Supabase connections query failed:', e);
-        return jsonResponse({ connections: [], data: [] });
+        const cached = getStored<ChannelConnection[]>(STORAGE_KEYS.CONNECTIONS, []);
+        return jsonResponse({ connections: cached, data: cached });
       }
     }
 
@@ -637,14 +669,14 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
   }
 
   if (pathname === '/api/connections' && method === 'POST') {
-    const currentUser = getStored<User>(STORAGE_KEYS.USER, DEFAULT_USER);
+    const userId = await resolveCurrentUserId();
     const connections = getStored<ChannelConnection[]>(STORAGE_KEYS.CONNECTIONS, DEFAULT_CONNECTIONS);
     const agents = getStored<Agent[]>(STORAGE_KEYS.AGENTS, []);
     const matchedAgent = agents.find(a => a.id === body?.agent_id);
 
     let newConn: ChannelConnection = {
       id: `conn_${Date.now()}`,
-      user_id: currentUser.id || 'user_default',
+      user_id: userId || 'user_default',
       agent_id: body?.agent_id || null,
       channel: body?.channel || 'whatsapp',
       display_name: body?.display_name || `${body?.channel || 'Channel'} Connection`,
@@ -664,9 +696,9 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
       agents: matchedAgent ? { name: matchedAgent.name } : undefined,
     };
 
-    if (isSupabaseConfigured && currentUser.id && !currentUser.id.startsWith('user_default')) {
+    if (isSupabaseConfigured && userId && !userId.startsWith('user_default')) {
       try {
-        const created = await createSupabaseConnection(newConn, currentUser.id);
+        const created = await createSupabaseConnection(newConn, userId);
         if (created) newConn = created;
       } catch (e) {
         console.warn('[Zivofly] Supabase connection creation error, saved locally:', e);
@@ -690,8 +722,8 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
     }
 
     if (method === 'PUT') {
-      if (idx === -1) return jsonResponse({ error: 'Connection not found' }, 404);
-      let updated = { ...connections[idx], ...body };
+      const baseConn = idx !== -1 ? connections[idx] : { id: connId } as ChannelConnection;
+      let updated = { ...baseConn, ...body };
       if (isSupabaseConfigured) {
         try {
           const supaUpdated = await updateSupabaseConnection(connId, updated);
@@ -700,21 +732,25 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
           console.warn('[Zivofly] Supabase connection update error:', e);
         }
       }
-      connections[idx] = updated;
+      if (idx !== -1) {
+        connections[idx] = updated;
+      } else {
+        connections.unshift(updated);
+      }
       setStored(STORAGE_KEYS.CONNECTIONS, connections);
-      return jsonResponse({ connection: connections[idx], data: connections[idx] });
+      return jsonResponse({ connection: updated, data: updated });
     }
 
     if (method === 'DELETE') {
       if (idx !== -1) {
         connections.splice(idx, 1);
         setStored(STORAGE_KEYS.CONNECTIONS, connections);
-        if (isSupabaseConfigured) {
-          try {
-            await deleteSupabaseConnection(connId);
-          } catch (e) {
-            console.warn('[Zivofly] Supabase connection delete error:', e);
-          }
+      }
+      if (isSupabaseConfigured) {
+        try {
+          await deleteSupabaseConnection(connId);
+        } catch (e) {
+          console.warn('[Zivofly] Supabase connection delete error:', e);
         }
       }
       return jsonResponse({ success: true });
@@ -723,29 +759,16 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
 
   // --- Conversations & Inbox ---
   if (pathname === '/api/conversations' && method === 'GET') {
-    if (isSupabaseConfigured && supabase) {
+    const userId = await resolveCurrentUserId();
+    if (isSupabaseConfigured && userId && !userId.startsWith('user_default')) {
       try {
-        const { data: authData } = await supabase.auth.getUser();
-        const authUserId = authData?.user?.id;
-        if (authUserId) {
-          const supaConvs = await getSupabaseConversations(authUserId);
-          return jsonResponse({ conversations: supaConvs || [] });
-        }
-        return jsonResponse({ conversations: [] });
+        const supaConvs = await getSupabaseConversations(userId);
+        const list = supaConvs || [];
+        setStored(STORAGE_KEYS.CONVERSATIONS, list);
+        return jsonResponse({ conversations: list });
       } catch (e) {
         console.warn('[Zivofly] Supabase conversations query failed:', e);
-        return jsonResponse({ conversations: [] });
-      }
-    }
-
-    const currentUser = getStored<User>(STORAGE_KEYS.USER, DEFAULT_USER);
-    if (isSupabaseConfigured && currentUser.id && !currentUser.id.startsWith('user_default')) {
-      try {
-        const supaConvs = await getSupabaseConversations(currentUser.id);
-        return jsonResponse({ conversations: supaConvs || [] });
-      } catch (e) {
-        console.warn('[Zivofly] Supabase conversations query failed:', e);
-        return jsonResponse({ conversations: [] });
+        return jsonResponse({ conversations: getStored<Conversation[]>(STORAGE_KEYS.CONVERSATIONS, []) });
       }
     }
 
@@ -758,11 +781,30 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
   }
 
   if (pathname === '/api/conversations' && method === 'POST') {
+    const userId = await resolveCurrentUserId();
     const convs = getStored<Conversation[]>(STORAGE_KEYS.CONVERSATIONS, DEFAULT_CONVERSATIONS);
+
+    if (isSupabaseConfigured && userId && !userId.startsWith('user_default')) {
+      try {
+        const createdConv = await createSupabaseConversation(userId, {
+          agentId: body?.agentId,
+          platform: body?.platform || 'whatsapp',
+          customerName: body?.customerName || 'New Customer',
+          customerHandle: body?.customerHandle || '@customer',
+          message: body?.message || 'Hello!',
+        });
+        convs.unshift(createdConv);
+        setStored(STORAGE_KEYS.CONVERSATIONS, convs);
+        return jsonResponse({ conversation: createdConv });
+      } catch (e) {
+        console.warn('[Zivofly] Supabase create conversation error, falling back locally:', e);
+      }
+    }
+
     const newConv: Conversation = {
       id: `conv_${Date.now()}`,
       agentId: body?.agentId || DEFAULT_AGENT.id,
-      userId: 'user_default',
+      userId: userId || 'user_default',
       platform: body?.platform || 'whatsapp',
       customerName: body?.customerName || 'New Customer',
       customerHandle: body?.customerHandle || '@customer',
@@ -813,24 +855,91 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
     const convId = feedbackMatch[1];
     const convs = getStored<Conversation[]>(STORAGE_KEYS.CONVERSATIONS, DEFAULT_CONVERSATIONS);
     const conv = convs.find(c => c.id === convId);
+
+    const newRating = Number(body?.rating);
+    const newComment =
+      typeof body?.feedbackComment === 'string'
+        ? body.feedbackComment
+        : typeof body?.comment === 'string'
+        ? body.comment
+        : typeof body?.feedback === 'string'
+        ? body.feedback
+        : '';
+    const newTags: string[] = Array.isArray(body?.tags) ? body.tags : [];
+    const targetMsgId: string | undefined = body?.messageId;
+
+    if (isSupabaseConfigured) {
+      try {
+        const targetMsg = conv?.messages.find(m => m.id === targetMsgId);
+        const savedFeedback = await saveSupabaseConversationFeedback({
+          agentId: conv?.agentId || body?.agentId || null,
+          conversationId: convId,
+          messageId: targetMsgId || null,
+          feedbackId: targetMsg?.feedbackId || body?.feedbackId || null,
+          rating: newRating,
+          comment: newComment,
+          tags: newTags,
+        });
+
+        if (conv) {
+          if (targetMsgId) {
+            const msg = conv.messages.find(m => m.id === targetMsgId);
+            if (msg) {
+              msg.rating = savedFeedback.rating;
+              msg.feedback = savedFeedback.comment ?? '';
+              msg.feedbackTags = savedFeedback.tags;
+              msg.feedbackId = savedFeedback.id;
+              msg.feedbackCreatedAt = savedFeedback.created_at;
+            }
+          } else {
+            const lastAgentMsg = [...conv.messages].reverse().find(m => m.sender === 'agent');
+            if (lastAgentMsg) {
+              lastAgentMsg.rating = savedFeedback.rating;
+              lastAgentMsg.feedback = savedFeedback.comment ?? '';
+              lastAgentMsg.feedbackTags = savedFeedback.tags;
+              lastAgentMsg.feedbackId = savedFeedback.id;
+              lastAgentMsg.feedbackCreatedAt = savedFeedback.created_at;
+            }
+          }
+          conv.rating = savedFeedback.rating;
+          conv.feedbackComment = savedFeedback.comment ?? '';
+          conv.feedbackTags = savedFeedback.tags;
+          conv.feedbackId = savedFeedback.id;
+          setStored(STORAGE_KEYS.CONVERSATIONS, convs);
+        }
+
+        return jsonResponse({
+          conversation: conv || null,
+          feedback: savedFeedback,
+        });
+      } catch (err: any) {
+        return jsonResponse(
+          {
+            error:
+              err?.message || 'Failed to save feedback to Supabase.',
+          },
+          400
+        );
+      }
+    }
+
+    // Explicit demo mode only (when Supabase is not configured)
     if (!conv) return jsonResponse({ error: 'Conversation not found' }, 404);
 
-    const newRating = body?.rating;
-    const newComment = body?.feedbackComment || body?.feedback;
-
-    if (body?.messageId) {
-      const msg = conv.messages.find(m => m.id === body.messageId);
+    if (targetMsgId) {
+      const msg = conv.messages.find(m => m.id === targetMsgId);
       if (msg) {
-        if (newRating !== undefined) msg.rating = newRating;
-        if (newComment !== undefined) msg.feedback = newComment;
+        if (!Number.isNaN(newRating)) msg.rating = newRating;
+        msg.feedback = newComment;
+        msg.feedbackTags = newTags;
         msg.feedbackCreatedAt = new Date().toISOString();
       }
     } else {
-      // If no messageId was given, update the latest agent message
       const lastAgentMsg = [...conv.messages].reverse().find(m => m.sender === 'agent');
       if (lastAgentMsg) {
-        if (newRating !== undefined) lastAgentMsg.rating = newRating;
-        if (newComment !== undefined) lastAgentMsg.feedback = newComment;
+        if (!Number.isNaN(newRating)) lastAgentMsg.rating = newRating;
+        lastAgentMsg.feedback = newComment;
+        lastAgentMsg.feedbackTags = newTags;
         lastAgentMsg.feedbackCreatedAt = new Date().toISOString();
       }
     }

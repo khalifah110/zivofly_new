@@ -15,13 +15,37 @@ import { ProfilePage } from './pages/ProfilePage';
 import { Agent, ChannelConnection, Conversation, User } from './types';
 import { apiFetch } from './lib/api';
 import { supabase } from './lib/supabaseClient';
+import {
+  GOOGLE_OAUTH_RETURN_STORAGE_KEY,
+  processGoogleWorkspaceOAuthCallbackFromUrl,
+} from './lib/supabaseService';
 import { ThemeProvider, useTheme } from './context/ThemeContext';
 
 function AppContent() {
   const { theme } = useTheme();
-  const [currentPath, setCurrentPath] = useState<string>(
-    window.location.pathname || '/'
-  );
+  const [currentPath, setCurrentPath] = useState<string>(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.has('google_oauth')) {
+      try {
+        const saved = sessionStorage.getItem(GOOGLE_OAUTH_RETURN_STORAGE_KEY);
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          if (
+            parsed?.path &&
+            typeof parsed.path === 'string' &&
+            parsed.path.startsWith('/agents/')
+          ) {
+            const search = window.location.search || '';
+            window.history.replaceState({}, '', `${parsed.path}${search}`);
+            return parsed.path;
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+    return window.location.pathname || '/';
+  });
   const [user, setUser] = useState<User | null>(null);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [connections, setConnections] = useState<ChannelConnection[]>([]);
@@ -141,6 +165,40 @@ function AppContent() {
       };
     }
   }, []);
+
+  // Ensure Google OAuth callback query parameters are handled even if the Edge Function redirects to '/' or '/dashboard'
+  useEffect(() => {
+    if (isLoading) return;
+    const search = window.location.search || '';
+    if (!search) return;
+
+    const params = new URLSearchParams(search);
+    if (!params.has('google_oauth')) return;
+
+    if (!currentPath.startsWith('/agents/')) {
+      if (user && agents.length > 0) {
+        const targetPath = `/agents/${agents[0].id}`;
+        window.history.replaceState({}, '', `${targetPath}${search}`);
+        setCurrentPath(targetPath);
+        return;
+      }
+
+      void processGoogleWorkspaceOAuthCallbackFromUrl().then((res) => {
+        if (!res.handled) return;
+        if (res.outcome === 'success') {
+          toast.success(
+            res.message ||
+              `Connected ${res.serviceLabel || 'Google Workspace'} successfully!`
+          );
+        } else if (res.outcome === 'error') {
+          toast.error(
+            res.message ||
+              'Google Workspace authorization could not be completed.'
+          );
+        }
+      });
+    }
+  }, [isLoading, currentPath, user, agents]);
 
   // Handlers for state updates
   const handleSignOut = async () => {

@@ -18,6 +18,7 @@ import { SalesforceSection } from './SalesforceSection';
 import { HubSpotSection } from './HubSpotSection';
 import { GOOGLE_SHEET_TEMPLATES } from '../data/sheetTemplates';
 import { CustomAgentVoiceSection } from './CustomAgentVoiceSection';
+import { TikTokLogo } from './BrandLogos';
 
 interface CreateAgentModalProps {
   isOpen: boolean;
@@ -204,12 +205,13 @@ export const CreateAgentModal: React.FC<CreateAgentModalProps> = ({
               <label className="block text-xs font-semibold text-foreground">
                 Enabled Platforms
               </label>
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
                 {[
                   { id: 'whatsapp' as PlatformType, name: 'WhatsApp', icon: Phone },
                   { id: 'instagram' as PlatformType, name: 'Instagram', icon: Instagram },
+                  { id: 'tiktok' as PlatformType, name: 'TikTok', icon: TikTokLogo },
+                  { id: 'call' as PlatformType, name: 'Phone call', icon: PhoneCall },
                   { id: 'messenger' as PlatformType, name: 'Messenger', icon: Facebook },
-                  { id: 'call' as PlatformType, name: 'Phone Calls', icon: PhoneCall },
                 ].map((p) => {
                   const active = (platforms || []).includes(p.id);
                   const Icon = p.icon;

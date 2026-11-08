@@ -1,6 +1,7 @@
 import React from 'react';
 import { PlatformType, WhatItRepliesToConfig } from '../types';
 import { Instagram, Facebook } from 'lucide-react';
+import { TikTokLogo } from './BrandLogos';
 
 interface WhatItRepliesToSectionProps {
   value: WhatItRepliesToConfig;
@@ -15,14 +16,12 @@ export const WhatItRepliesToSection: React.FC<WhatItRepliesToSectionProps> = ({
 }) => {
   const safePlatforms = Array.isArray(platforms) ? platforms : [];
   const isInstagramActive = safePlatforms.includes('instagram');
+  const isTikTokActive = safePlatforms.includes('tiktok');
   const isFacebookActive = safePlatforms.includes('messenger');
 
-  // Appears if Instagram or Facebook is selected (even if WhatsApp or Call is also selected).
-  // If neither Instagram nor Facebook is selected, this section does not appear.
-  // The rules strictly apply to Instagram / Facebook, and WhatsApp / Calls are not shown here.
-  const hasMetaChannel = isInstagramActive || isFacebookActive;
+  const hasSocialChannel = isInstagramActive || isTikTokActive || isFacebookActive;
 
-  if (!hasMetaChannel) {
+  if (!hasSocialChannel) {
     return null;
   }
 
@@ -59,10 +58,17 @@ export const WhatItRepliesToSection: React.FC<WhatItRepliesToSectionProps> = ({
             </span>
           )}
 
+          {isTikTokActive && (
+            <span className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-semibold border border-[#0f4c3a] bg-[#0f4c3a]/10 text-[#0f4c3a]">
+              <TikTokLogo className="size-3" />
+              <span>TikTok</span>
+            </span>
+          )}
+
           {isFacebookActive && (
             <span className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-semibold border border-[#0f4c3a] bg-[#0f4c3a]/10 text-[#0f4c3a]">
               <Facebook className="size-3" />
-              <span>Facebook</span>
+              <span>Messenger</span>
             </span>
           )}
         </div>

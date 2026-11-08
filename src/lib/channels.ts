@@ -1,5 +1,5 @@
 export interface ChannelMeta {
-  key: 'whatsapp' | 'instagram' | 'messenger' | 'call';
+  key: 'whatsapp' | 'instagram' | 'tiktok' | 'call' | 'messenger';
   name: string;
   tagline: string;
   colorClass: string;
@@ -40,6 +40,36 @@ export const CHANNELS: Record<string, ChannelMeta> = {
     ],
     supportsComments: true
   },
+  tiktok: {
+    key: 'tiktok',
+    name: 'TikTok',
+    tagline: 'Reply to TikTok DMs, video comments and mentions automatically.',
+    colorClass: 'text-foreground',
+    bgLightClass: 'bg-neutral-900/10 text-neutral-900 border-neutral-900/20',
+    borderColorClass: 'border-neutral-900/30',
+    steps: [
+      'Sign in with TikTok',
+      'Allow training on your profile',
+      'Pick or create your agent',
+      'Go live'
+    ],
+    supportsComments: true
+  },
+  call: {
+    key: 'call',
+    name: 'Phone call',
+    tagline: 'A voice agent that picks up your business line.',
+    colorClass: 'text-call',
+    bgLightClass: 'bg-amber-500/10 text-amber-700 border-amber-500/20',
+    borderColorClass: 'border-amber-500/30',
+    steps: [
+      'Add your business number',
+      'Verify it',
+      'Pick or create your agent',
+      'Go live'
+    ],
+    supportsComments: false
+  },
   messenger: {
     key: 'messenger',
     name: 'Messenger',
@@ -54,20 +84,5 @@ export const CHANNELS: Record<string, ChannelMeta> = {
       'Go live'
     ],
     supportsComments: true
-  },
-  call: {
-    key: 'call',
-    name: 'Calls',
-    tagline: 'A voice agent that picks up your business line.',
-    colorClass: 'text-call',
-    bgLightClass: 'bg-amber-500/10 text-amber-700 border-amber-500/20',
-    borderColorClass: 'border-amber-500/30',
-    steps: [
-      'Add your business number',
-      'Verify it',
-      'Pick or create your agent',
-      'Go live'
-    ],
-    supportsComments: false
   }
 };

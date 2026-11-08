@@ -22,30 +22,34 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({ connections, onNav
         </p>
       </div>
 
-      {/* 4 Channel Selection Cards */}
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        {Object.values(CHANNELS).map((channel) => (
-          <button
-            key={channel.key}
-            onClick={() => onNavigate(`/connect/${channel.key}`)}
-            className="surface-card flex flex-col justify-between p-6 text-left transition-all hover:border-border/80 hover:shadow-md group"
-          >
-            <div>
-              <div className="size-11 rounded-xl bg-accent flex items-center justify-center mb-4">
-                <ChannelIcon channel={channel.key} size={22} />
+      {/* 5 Channel Selection Cards */}
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+        {(['whatsapp', 'instagram', 'tiktok', 'call', 'messenger'] as const).map((key) => {
+          const channel = CHANNELS[key];
+          if (!channel) return null;
+          return (
+            <button
+              key={channel.key}
+              onClick={() => onNavigate(`/connect/${channel.key}`)}
+              className="surface-card flex flex-col justify-between p-6 text-left transition-all hover:border-border/80 hover:shadow-md group"
+            >
+              <div>
+                <div className="size-11 rounded-xl bg-accent flex items-center justify-center mb-4">
+                  <ChannelIcon channel={channel.key} size={22} />
+                </div>
+                <h3 className="text-xl font-medium text-foreground">{channel.name}</h3>
+                <p className="mt-2 text-sm text-muted-foreground leading-relaxed">
+                  {channel.tagline}
+                </p>
               </div>
-              <h3 className="text-xl font-medium text-foreground">{channel.name}</h3>
-              <p className="mt-2 text-sm text-muted-foreground leading-relaxed">
-                {channel.tagline}
-              </p>
-            </div>
 
-            <div className="mt-6 flex items-center gap-1.5 text-xs font-medium text-primary group-hover:translate-x-1 transition-transform">
-              <span>Connect</span>
-              <ArrowRight className="size-3.5" />
-            </div>
-          </button>
-        ))}
+              <div className="mt-6 flex items-center gap-1.5 text-xs font-medium text-primary group-hover:translate-x-1 transition-transform">
+                <span>Connect</span>
+                <ArrowRight className="size-3.5" />
+              </div>
+            </button>
+          );
+        })}
       </div>
 
       {/* Connected Accounts Section */}

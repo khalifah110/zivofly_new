@@ -44,8 +44,8 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onNavigate, isAuthenti
           </div>
         </div>
 
-        {/* 4 Channels Preview Grid */}
-        <div className="mt-20 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        {/* 5 Channels Preview Grid */}
+        <div className="mt-20 grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
           <div
             onClick={() => onNavigate(isAuthenticated ? '/connect/whatsapp' : '/auth')}
             className="surface-card p-6 cursor-pointer hover:border-border/80 hover:shadow-md transition-all group"
@@ -73,15 +73,15 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onNavigate, isAuthenti
           </div>
 
           <div
-            onClick={() => onNavigate(isAuthenticated ? '/connect/messenger' : '/auth')}
+            onClick={() => onNavigate(isAuthenticated ? '/connect/tiktok' : '/auth')}
             className="surface-card p-6 cursor-pointer hover:border-border/80 hover:shadow-md transition-all group"
           >
-            <div className="size-10 rounded-xl bg-blue-500/10 flex items-center justify-center mb-4">
-              <ChannelIcon channel="messenger" size={22} />
+            <div className="size-10 rounded-xl bg-neutral-900/10 flex items-center justify-center mb-4">
+              <ChannelIcon channel="tiktok" size={22} />
             </div>
-            <h3 className="text-lg font-medium text-foreground">Messenger</h3>
+            <h3 className="text-lg font-medium text-foreground">TikTok</h3>
             <p className="mt-2 text-sm text-muted-foreground leading-relaxed">
-              Handle Page messages automatically.
+              Reply to TikTok DMs, comments and mentions.
             </p>
           </div>
 
@@ -92,9 +92,22 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onNavigate, isAuthenti
             <div className="size-10 rounded-xl bg-amber-500/10 flex items-center justify-center mb-4">
               <ChannelIcon channel="call" size={22} />
             </div>
-            <h3 className="text-lg font-medium text-foreground">Calls</h3>
+            <h3 className="text-lg font-medium text-foreground">Phone call</h3>
             <p className="mt-2 text-sm text-muted-foreground leading-relaxed">
               A voice agent that picks up the line.
+            </p>
+          </div>
+
+          <div
+            onClick={() => onNavigate(isAuthenticated ? '/connect/messenger' : '/auth')}
+            className="surface-card p-6 cursor-pointer hover:border-border/80 hover:shadow-md transition-all group"
+          >
+            <div className="size-10 rounded-xl bg-blue-500/10 flex items-center justify-center mb-4">
+              <ChannelIcon channel="messenger" size={22} />
+            </div>
+            <h3 className="text-lg font-medium text-foreground">Messenger</h3>
+            <p className="mt-2 text-sm text-muted-foreground leading-relaxed">
+              Handle Page messages automatically.
             </p>
           </div>
         </div>

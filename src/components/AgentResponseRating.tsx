@@ -1,5 +1,14 @@
 import React, { useState } from 'react';
-import { Star, MessageSquare, Check, Pencil, X, RotateCcw } from 'lucide-react';
+import {
+  Star,
+  MessageSquare,
+  Check,
+  Pencil,
+  X,
+  RotateCcw,
+  Loader2,
+  AlertCircle,
+} from 'lucide-react';
 import { toast } from 'sonner';
 
 export interface RatingOption {
@@ -32,8 +41,14 @@ export interface AgentResponseRatingProps {
   messageText: string;
   rating?: number;
   feedback?: string;
+  feedbackTags?: string[];
   feedbackCreatedAt?: string;
-  onUpdateFeedback: (messageId: string, rating: number, feedback: string) => void;
+  onUpdateFeedback: (
+    messageId: string,
+    rating: number,
+    feedback: string,
+    tags: string[]
+  ) => Promise<void> | void;
   align?: 'left' | 'right';
   className?: string;
   children: React.ReactNode;
@@ -44,6 +59,7 @@ export const AgentResponseRating: React.FC<AgentResponseRatingProps> = ({
   messageText,
   rating,
   feedback,
+  feedbackTags = [],
   onUpdateFeedback,
   align = 'left',
   className = '',
@@ -53,66 +69,102 @@ export const AgentResponseRating: React.FC<AgentResponseRatingProps> = ({
   const [hoveredStar, setHoveredStar] = useState<number | null>(null);
   const [isFeedbackOpen, setIsFeedbackOpen] = useState(false);
 
-  // Form states inside modal
+  // Form states inside modal (tags and written comment stored separately)
   const [selectedRating, setSelectedRating] = useState<number>(rating || 5);
   const [hoveredModalStar, setHoveredModalStar] = useState<number | null>(null);
+  const [selectedTags, setSelectedTags] = useState<string[]>(
+    Array.isArray(feedbackTags) ? feedbackTags : []
+  );
   const [commentText, setCommentText] = useState<string>(feedback || '');
+  const [isSaving, setIsSaving] = useState<boolean>(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   const activeRatingTier =
     RATING_TIERS.find(
       (r) => r.stars === (hoveredModalStar !== null ? hoveredModalStar : selectedRating)
     ) || RATING_TIERS[4];
 
-  const handleQuickStarRate = (star: number, e?: React.MouseEvent) => {
+  const handleQuickStarRate = async (star: number, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
-    const defaultPraise = star === 5 ? 'Job well done, keep it up!' : '';
-    const updatedFeedback = feedback || defaultPraise;
-    onUpdateFeedback(messageId, star, updatedFeedback);
-    const tier = RATING_TIERS.find((t) => t.stars === star);
-    toast.success(`${tier?.emoji || '⭐'} Rated message ${star}/5 stars: ${tier?.label || ''}`);
+    if (isSaving) return;
+
+    const existingComment = (feedback || '').trim();
+    const existingTags = Array.isArray(feedbackTags) ? feedbackTags : [];
+
+    setIsSaving(true);
+    setSaveError(null);
+    try {
+      await onUpdateFeedback(messageId, star, existingComment, existingTags);
+      const tier = RATING_TIERS.find((t) => t.stars === star);
+      toast.success(
+        `${tier?.emoji || '⭐'} Rated message ${star}/5 stars: ${tier?.label || ''}`
+      );
+    } catch (err: any) {
+      const errMsg =
+        err?.message || 'Failed to save message rating to database.';
+      toast.error(errMsg);
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   const handleOpenFeedback = (e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
     setSelectedRating(rating || 5);
+    setSelectedTags(Array.isArray(feedbackTags) ? feedbackTags : []);
     setCommentText(feedback || '');
     setHoveredModalStar(null);
+    setSaveError(null);
     setIsFeedbackOpen(true);
   };
 
-  const handleSaveModalFeedback = (e?: React.FormEvent) => {
+  const handleSaveModalFeedback = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (selectedRating < 1) {
-      toast.error('Please select at least 1 star');
+    if (isSaving) return;
+
+    if (!Number.isInteger(selectedRating) || selectedRating < 1 || selectedRating > 5) {
+      toast.error('Please select a rating between 1 and 5 stars');
       return;
     }
 
     const trimmedComment = commentText.trim();
-    onUpdateFeedback(messageId, selectedRating, trimmedComment);
-    setIsFeedbackOpen(false);
+    const cleanTags = Array.from(
+      new Set(selectedTags.map((t) => t.trim()).filter(Boolean))
+    );
 
-    if (selectedRating === 5) {
-      toast.success('Message rating saved: Job well done, keep it up!');
-    } else {
-      toast.success(`Message feedback saved (${selectedRating}/5 stars)`);
+    setIsSaving(true);
+    setSaveError(null);
+
+    try {
+      await onUpdateFeedback(messageId, selectedRating, trimmedComment, cleanTags);
+      setIsFeedbackOpen(false);
+
+      if (selectedRating === 5) {
+        toast.success('Message rating saved: Job well done, keep it up!');
+      } else {
+        toast.success(`Message feedback saved (${selectedRating}/5 stars)`);
+      }
+    } catch (err: any) {
+      const errMsg =
+        err?.message || 'Failed to save feedback to database.';
+      setSaveError(errMsg);
+      toast.error(errMsg);
+    } finally {
+      setIsSaving(false);
     }
   };
 
   const handleToggleTag = (tag: string) => {
-    if (commentText.includes(tag)) {
-      const updated = commentText
-        .replace(tag, '')
-        .replace(/\n\s*\n/g, '\n')
-        .trim();
-      setCommentText(updated);
-    } else {
-      if (!commentText.trim()) {
-        setCommentText(tag);
-      } else {
-        setCommentText(`${commentText.trim()} • ${tag}`);
-      }
-    }
+    if (isSaving) return;
+    setSelectedTags((prev) =>
+      prev.includes(tag) ? prev.filter((t) => t !== tag) : [...prev, tag]
+    );
   };
+
+  const hasSavedFeedback =
+    Boolean(rating) ||
+    Boolean(feedback && feedback.trim()) ||
+    (Array.isArray(feedbackTags) && feedbackTags.length > 0);
 
   return (
     <div
@@ -150,9 +202,10 @@ export const AgentResponseRating: React.FC<AgentResponseRatingProps> = ({
                 <button
                   key={star}
                   type="button"
+                  disabled={isSaving}
                   onClick={(e) => handleQuickStarRate(star, e)}
                   onMouseEnter={() => setHoveredStar(star)}
-                  className="p-0.5 transition-transform hover:scale-125 cursor-pointer text-muted-foreground hover:text-amber-500"
+                  className="p-0.5 transition-transform hover:scale-125 cursor-pointer text-muted-foreground hover:text-amber-500 disabled:opacity-50"
                   title={`${star} Star${star > 1 ? 's' : ''}`}
                   aria-label={`Rate ${star} star`}
                 >
@@ -173,8 +226,9 @@ export const AgentResponseRating: React.FC<AgentResponseRatingProps> = ({
           {/* Open Feedback Modal */}
           <button
             type="button"
+            disabled={isSaving}
             onClick={handleOpenFeedback}
-            className="flex items-center gap-1 text-[11px] font-medium text-muted-foreground hover:text-foreground transition-colors px-1 py-0.5 rounded cursor-pointer"
+            className="flex items-center gap-1 text-[11px] font-medium text-muted-foreground hover:text-foreground transition-colors px-1 py-0.5 rounded cursor-pointer disabled:opacity-50"
             title="Rate & Leave instructions"
           >
             <MessageSquare className="size-3" />
@@ -183,8 +237,8 @@ export const AgentResponseRating: React.FC<AgentResponseRatingProps> = ({
         </div>
       </div>
 
-      {/* Saved Rating & Comments Badges under the message - IDENTICAL TO TRY IT */}
-      {(rating || feedback) ? (
+      {/* Saved Rating, Tags & Comments Badges under the message */}
+      {hasSavedFeedback ? (
         <div
           className={`flex flex-wrap items-center gap-1.5 mt-1 text-xs ${
             align === 'right' ? 'justify-end pr-1' : 'justify-start pl-1'
@@ -205,6 +259,19 @@ export const AgentResponseRating: React.FC<AgentResponseRatingProps> = ({
               <span>{rating}/5</span>
             </button>
           )}
+
+          {Array.isArray(feedbackTags) &&
+            feedbackTags.map((tag) => (
+              <button
+                key={tag}
+                type="button"
+                onClick={handleOpenFeedback}
+                className="inline-flex items-center gap-1 rounded-lg bg-primary/10 border border-primary/20 px-2 py-0.5 text-[11px] font-medium text-primary hover:bg-primary/15 transition-colors cursor-pointer"
+                title="Click to edit feedback tags"
+              >
+                <span>{tag}</span>
+              </button>
+            ))}
 
           {feedback && (
             <button
@@ -240,7 +307,9 @@ export const AgentResponseRating: React.FC<AgentResponseRatingProps> = ({
       {isFeedbackOpen && (
         <div
           className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/60 p-0 sm:p-4 backdrop-blur-xs animate-in fade-in duration-150"
-          onClick={() => setIsFeedbackOpen(false)}
+          onClick={() => {
+            if (!isSaving) setIsFeedbackOpen(false);
+          }}
         >
           <div
             className="w-full sm:max-w-md max-h-[90vh] overflow-y-auto rounded-t-2xl sm:rounded-2xl border border-border bg-card text-card-foreground p-5 sm:p-6 shadow-2xl space-y-4 animate-in slide-in-from-bottom-3 sm:zoom-in-95 duration-150 text-left"
@@ -259,8 +328,9 @@ export const AgentResponseRating: React.FC<AgentResponseRatingProps> = ({
 
               <button
                 type="button"
+                disabled={isSaving}
                 onClick={() => setIsFeedbackOpen(false)}
-                className="p-1.5 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted transition-colors cursor-pointer"
+                className="p-1.5 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted transition-colors cursor-pointer disabled:opacity-50"
                 aria-label="Close"
               >
                 <X className="size-4" />
@@ -303,10 +373,11 @@ export const AgentResponseRating: React.FC<AgentResponseRatingProps> = ({
                     <button
                       key={tier.stars}
                       type="button"
+                      disabled={isSaving}
                       onClick={() => setSelectedRating(tier.stars)}
                       onMouseEnter={() => setHoveredModalStar(tier.stars)}
                       onMouseLeave={() => setHoveredModalStar(null)}
-                      className="p-1 transition-transform hover:scale-115 active:scale-95 cursor-pointer focus:outline-hidden"
+                      className="p-1 transition-transform hover:scale-115 active:scale-95 cursor-pointer focus:outline-hidden disabled:opacity-50"
                       title={`${tier.stars} - ${tier.label}`}
                     >
                       <Star
@@ -329,13 +400,14 @@ export const AgentResponseRating: React.FC<AgentResponseRatingProps> = ({
               </label>
               <div className="flex flex-wrap gap-1.5">
                 {SUGGESTED_FEEDBACK.map((tag) => {
-                  const isSelected = commentText.includes(tag);
+                  const isSelected = selectedTags.includes(tag);
                   return (
                     <button
                       key={tag}
                       type="button"
+                      disabled={isSaving}
                       onClick={() => handleToggleTag(tag)}
-                      className={`rounded-lg px-2.5 py-1 text-[11px] transition-all cursor-pointer ${
+                      className={`rounded-lg px-2.5 py-1 text-[11px] transition-all cursor-pointer disabled:opacity-50 ${
                         isSelected
                           ? 'bg-primary text-primary-foreground font-semibold shadow-2xs'
                           : 'bg-muted/70 text-foreground/80 hover:text-foreground hover:bg-muted border border-border'
@@ -357,8 +429,9 @@ export const AgentResponseRating: React.FC<AgentResponseRatingProps> = ({
                 {commentText && (
                   <button
                     type="button"
+                    disabled={isSaving}
                     onClick={() => setCommentText('')}
-                    className="text-[10px] text-muted-foreground hover:text-destructive flex items-center gap-0.5 cursor-pointer"
+                    className="text-[10px] text-muted-foreground hover:text-destructive flex items-center gap-0.5 cursor-pointer disabled:opacity-50"
                   >
                     <RotateCcw className="size-2.5" /> Clear
                   </button>
@@ -366,29 +439,54 @@ export const AgentResponseRating: React.FC<AgentResponseRatingProps> = ({
               </div>
               <textarea
                 rows={3}
+                disabled={isSaving}
                 value={commentText}
                 onChange={(e) => setCommentText(e.target.value)}
                 placeholder="Add instructions on how the agent should have answered this specific message..."
-                className="w-full rounded-xl border border-border bg-background text-foreground placeholder:text-muted-foreground focus:border-primary focus:outline-none shadow-2xs leading-relaxed p-2.5 text-xs"
+                className="w-full rounded-xl border border-border bg-background text-foreground placeholder:text-muted-foreground focus:border-primary focus:outline-none shadow-2xs leading-relaxed p-2.5 text-xs disabled:opacity-60"
               />
             </div>
+
+            {/* Save Error Alert */}
+            {saveError && (
+              <div className="flex items-start gap-2 rounded-xl border border-destructive/30 bg-destructive/10 p-3 text-xs text-destructive">
+                <AlertCircle className="size-4 shrink-0 mt-0.5" />
+                <div className="space-y-0.5 min-w-0">
+                  <p className="font-semibold">Failed to save feedback</p>
+                  <p className="text-[11px] leading-relaxed break-words">
+                    {saveError}
+                  </p>
+                </div>
+              </div>
+            )}
 
             {/* Modal Footer Actions */}
             <div className="flex items-center justify-end gap-2 pt-2 border-t border-border">
               <button
                 type="button"
+                disabled={isSaving}
                 onClick={() => setIsFeedbackOpen(false)}
-                className="rounded-xl border border-border bg-card text-foreground hover:bg-muted transition-colors px-3.5 py-2 text-xs font-medium cursor-pointer"
+                className="rounded-xl border border-border bg-card text-foreground hover:bg-muted transition-colors px-3.5 py-2 text-xs font-medium cursor-pointer disabled:opacity-50"
               >
                 Cancel
               </button>
               <button
                 type="button"
+                disabled={isSaving}
                 onClick={() => handleSaveModalFeedback()}
-                className="rounded-xl bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground hover:bg-primary/90 transition-opacity shadow-xs flex items-center gap-1.5 cursor-pointer"
+                className="rounded-xl bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground hover:bg-primary/90 transition-opacity shadow-xs flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
               >
-                <Check className="size-3.5" />
-                <span>Save Feedback</span>
+                {isSaving ? (
+                  <>
+                    <Loader2 className="size-3.5 animate-spin" />
+                    <span>Saving...</span>
+                  </>
+                ) : (
+                  <>
+                    <Check className="size-3.5" />
+                    <span>Save Feedback</span>
+                  </>
+                )}
               </button>
             </div>
           </div>

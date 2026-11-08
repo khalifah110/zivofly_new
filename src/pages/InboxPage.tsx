@@ -50,51 +50,62 @@ export const InboxPage: React.FC<InboxPageProps> = ({
     }
   };
 
-  const handleMessageFeedback = async (messageId: string, rating: number, feedback: string) => {
-    if (!activeConv) return;
-    try {
-      const res = await apiFetch(`/api/conversations/${activeConv.id}/feedback`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messageId,
-          rating,
-          feedbackComment: feedback,
-        }),
-      });
-
-      const updatedMessages = activeConv.messages.map((m) =>
-        m.id === messageId
-          ? { ...m, rating, feedback, feedbackCreatedAt: new Date().toISOString() }
-          : m
-      );
-
-      const updatedConv: Conversation = {
-        ...activeConv,
-        messages: updatedMessages,
-      };
-
-      if (res.ok) {
-        const data = await res.json();
-        if (data.conversation) {
-          onUpdateConversation(data.conversation);
-          return;
-        }
-      }
-      onUpdateConversation(updatedConv);
-    } catch (err) {
-      console.error('Error rating response:', err);
-      // Still update locally for smooth UX
-      const updatedMessages = activeConv.messages.map((m) =>
-        m.id === messageId
-          ? { ...m, rating, feedback, feedbackCreatedAt: new Date().toISOString() }
-          : m
-      );
-      onUpdateConversation({
-        ...activeConv,
-        messages: updatedMessages,
-      });
+  const handleMessageFeedback = async (
+    messageId: string,
+    rating: number,
+    feedback: string,
+    tags: string[] = []
+  ): Promise<void> => {
+    if (!activeConv) {
+      throw new Error('No active conversation selected.');
     }
+
+    const targetMsg = activeConv.messages.find((m) => m.id === messageId);
+
+    const res = await apiFetch(`/api/conversations/${activeConv.id}/feedback`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        agentId: activeConv.agentId || null,
+        messageId,
+        feedbackId: targetMsg?.feedbackId || null,
+        rating,
+        feedbackComment: feedback,
+        tags,
+      }),
+    });
+
+    const data = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+      throw new Error(
+        data?.error || `Failed to save feedback (HTTP ${res.status}).`
+      );
+    }
+
+    if (data?.conversation) {
+      onUpdateConversation(data.conversation);
+      return;
+    }
+
+    const savedFb = data?.feedback;
+    const updatedMessages = activeConv.messages.map((m) =>
+      m.id === messageId
+        ? {
+            ...m,
+            rating: savedFb?.rating ?? rating,
+            feedback: savedFb?.comment ?? feedback,
+            feedbackTags: Array.isArray(savedFb?.tags) ? savedFb.tags : tags,
+            feedbackId: savedFb?.id ?? m.feedbackId,
+            feedbackCreatedAt: savedFb?.created_at ?? new Date().toISOString(),
+          }
+        : m
+    );
+
+    onUpdateConversation({
+      ...activeConv,
+      messages: updatedMessages,
+    });
   };
 
   const handleSendMessage = async (e: React.FormEvent) => {
@@ -276,6 +287,7 @@ export const InboxPage: React.FC<InboxPageProps> = ({
                         messageText={m.text}
                         rating={m.rating}
                         feedback={m.feedback}
+                        feedbackTags={m.feedbackTags}
                         feedbackCreatedAt={m.feedbackCreatedAt}
                         onUpdateFeedback={handleMessageFeedback}
                         align="right"

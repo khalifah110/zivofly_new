@@ -1,11 +1,18 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   ChevronDown,
   ChevronUp,
   CheckCircle2,
+  Loader2,
+  AlertCircle,
+  RefreshCw,
 } from 'lucide-react';
 import { toast } from 'sonner';
-import { GoogleWorkspaceConfig, GoogleSheetToolConfig } from '../types';
+import {
+  GoogleWorkspaceConfig,
+  GoogleWorkspaceIntegrationStatus,
+  GoogleWorkspaceServiceIdentifier,
+} from '../types';
 import {
   GoogleWorkspaceLogo,
   GmailLogo,
@@ -14,144 +21,253 @@ import {
   GoogleSheetsLogo,
   GoogleCalendarLogo,
 } from './BrandLogos';
+import {
+  createEmptyGoogleConnectionsMap,
+  getGoogleWorkspaceIntegrationConnections,
+  GOOGLE_WORKSPACE_SERVICE_MAP,
+  GoogleIntegrationConnectionRecord,
+  GoogleWorkspaceUiKey,
+  processGoogleWorkspaceOAuthCallbackFromUrl,
+  startGoogleWorkspaceOAuth,
+  syncGoogleWorkspaceConfigWithRecords,
+} from '../lib/supabaseService';
 
 interface GoogleWorkspaceSectionProps {
   value?: GoogleWorkspaceConfig;
   onChange?: (config: GoogleWorkspaceConfig) => void;
+  workspaceId?: string | null;
+  agentId?: string | null;
   compact?: boolean;
 }
 
 export const GoogleWorkspaceSection: React.FC<GoogleWorkspaceSectionProps> = ({
   value,
   onChange,
-  compact = false,
+  workspaceId,
+  agentId,
 }) => {
   const [isExpanded, setIsExpanded] = useState(true);
+  const [connectionsByService, setConnectionsByService] = useState<
+    Record<
+      GoogleWorkspaceServiceIdentifier,
+      GoogleIntegrationConnectionRecord | null
+    >
+  >(() => createEmptyGoogleConnectionsMap());
+  const [isLoadingStatus, setIsLoadingStatus] = useState<boolean>(false);
+  const [connectingService, setConnectingService] =
+    useState<GoogleWorkspaceServiceIdentifier | null>(null);
 
-  // Safe fallback state
-  const config: GoogleWorkspaceConfig = value || {
-    gmail: { enabled: false, status: 'disconnected' },
-    drive: { enabled: false, status: 'disconnected' },
-    docs: { enabled: false, status: 'disconnected' },
-    sheets: { enabled: false, columns: [], sheetName: 'Sheet1', status: 'disconnected' },
-    calendar: { enabled: false, status: 'disconnected' },
+  const valueRef = useRef<GoogleWorkspaceConfig | undefined>(value);
+  valueRef.current = value;
+  const onChangeRef = useRef<typeof onChange>(onChange);
+  onChangeRef.current = onChange;
+
+  const applyConnectionsToParent = useCallback(
+    (
+      nextMap: Record<
+        GoogleWorkspaceServiceIdentifier,
+        GoogleIntegrationConnectionRecord | null
+      >
+    ) => {
+      setConnectionsByService(nextMap);
+      if (onChangeRef.current) {
+        const synced = syncGoogleWorkspaceConfigWithRecords(
+          valueRef.current,
+          nextMap
+        );
+        onChangeRef.current(synced);
+      }
+    },
+    []
+  );
+
+  // Load real connection statuses from `public.integration_connections` and handle any OAuth callback query params
+  useEffect(() => {
+    let cancelled = false;
+
+    const initializeGoogleIntegrations = async () => {
+      setIsLoadingStatus(true);
+      try {
+        // 1. Check if the browser URL contains a Google OAuth callback (?google_oauth=success|error)
+        const callbackRes = await processGoogleWorkspaceOAuthCallbackFromUrl({
+          workspaceId,
+          agentId,
+        });
+
+        if (cancelled) return;
+
+        if (callbackRes.handled) {
+          if (callbackRes.connectionsByService) {
+            applyConnectionsToParent(callbackRes.connectionsByService);
+          }
+          if (callbackRes.outcome === 'success') {
+            toast.success(
+              callbackRes.message ||
+                `Connected ${callbackRes.serviceLabel || 'Google Workspace'} successfully!`
+            );
+          } else if (callbackRes.outcome === 'error') {
+            toast.error(
+              callbackRes.message ||
+                'Google Workspace authorization could not be completed.'
+            );
+          }
+          // If callback already fetched fresh connections from Supabase, we are up to date
+          if (callbackRes.connectionsByService) {
+            return;
+          }
+        }
+
+        // 2. Query actual connection records from `public.integration_connections`
+        const { connectionsByService: freshMap } =
+          await getGoogleWorkspaceIntegrationConnections({
+            workspaceId,
+            agentId,
+          });
+
+        if (!cancelled) {
+          applyConnectionsToParent(freshMap);
+        }
+      } catch (err: any) {
+        // If user is not authenticated yet, keep default disconnected map without inventing records
+        if (!cancelled) {
+          setConnectionsByService(createEmptyGoogleConnectionsMap());
+        }
+      } finally {
+        if (!cancelled) {
+          setIsLoadingStatus(false);
+        }
+      }
+    };
+
+    void initializeGoogleIntegrations();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceId, agentId, applyConnectionsToParent]);
+
+  const getAppRecordState = (
+    key: GoogleWorkspaceUiKey
+  ): {
+    service: GoogleWorkspaceServiceIdentifier;
+    status: GoogleWorkspaceIntegrationStatus;
+    email?: string;
+    lastError?: string | null;
+  } => {
+    const service = GOOGLE_WORKSPACE_SERVICE_MAP[key];
+    const record = connectionsByService[service];
+    if (!record) {
+      return {
+        service,
+        status: 'disconnected',
+        email: undefined,
+        lastError: null,
+      };
+    }
+
+    return {
+      service,
+      status: record.status,
+      email: record.account_email || undefined,
+      lastError: record.last_error || null,
+    };
   };
 
-  const apps = [
+  const apps: Array<{
+    key: GoogleWorkspaceUiKey;
+    service: GoogleWorkspaceServiceIdentifier;
+    name: string;
+    logo: React.FC<{ className?: string }>;
+    description: string;
+    status: GoogleWorkspaceIntegrationStatus;
+    isConnected: boolean;
+    email?: string;
+    lastError?: string | null;
+  }> = [
     {
-      key: 'gmail' as const,
+      key: 'gmail',
       name: 'Gmail',
       logo: GmailLogo,
       description:
         'Send automated booking confirmations, draft replies to client inquiries, and read inbound requests.',
-      isConnected: config.gmail?.status === 'connected',
-      email: config.gmail?.accountEmail,
+      ...getAppRecordState('gmail'),
+      isConnected: getAppRecordState('gmail').status === 'connected',
     },
     {
-      key: 'drive' as const,
+      key: 'drive',
       name: 'Google Drive',
       logo: GoogleDriveLogo,
       description:
         'Store shared client assets, access product catalogs and media folders, and archive generated receipts.',
-      isConnected: config.drive?.status === 'connected',
-      email: config.drive?.accountEmail,
+      ...getAppRecordState('drive'),
+      isConnected: getAppRecordState('drive').status === 'connected',
     },
     {
-      key: 'docs' as const,
+      key: 'docs',
       name: 'Google Docs',
       logo: GoogleDocsLogo,
       description:
         'Read standard operating procedures, extract policy guidelines, and generate formatted agreements.',
-      isConnected: config.docs?.status === 'connected',
-      email: config.docs?.accountEmail,
+      ...getAppRecordState('docs'),
+      isConnected: getAppRecordState('docs').status === 'connected',
     },
     {
-      key: 'sheets' as const,
+      key: 'sheets',
       name: 'Google Sheets',
       logo: GoogleSheetsLogo,
       description:
         'Sync live product catalogues, pricing lists, or capture leads directly into your Google spreadsheets.',
-      isConnected: config.sheets?.status === 'connected',
-      email: undefined,
+      ...getAppRecordState('sheets'),
+      isConnected: getAppRecordState('sheets').status === 'connected',
     },
     {
-      key: 'calendar' as const,
+      key: 'calendar',
       name: 'Google Calendar',
       logo: GoogleCalendarLogo,
       description:
         'Check real-time slot availability, schedule customer bookings, and dispatch Google Meet invites.',
-      isConnected: config.calendar?.status === 'connected',
-      email: config.calendar?.accountEmail,
+      ...getAppRecordState('calendar'),
+      isConnected: getAppRecordState('calendar').status === 'connected',
     },
   ];
 
   const connectedCount = apps.filter((app) => app.isConnected).length;
 
-  const handleConnect = (key: 'gmail' | 'drive' | 'docs' | 'sheets' | 'calendar', appName: string) => {
-    if (key === 'sheets') {
-      const currentSheets: GoogleSheetToolConfig = config.sheets || {
-        enabled: false,
-        columns: [],
-        sheetName: 'Sheet1',
-      };
-      const updated: GoogleWorkspaceConfig = {
-        ...config,
-        sheets: {
-          ...currentSheets,
-          enabled: true,
-          status: 'connected',
-          lastSyncedAt: new Date().toISOString(),
-        },
-      };
-      onChange?.(updated);
-    } else {
-      const currentApp = config[key] || { enabled: false, status: 'disconnected' };
-      const updated: GoogleWorkspaceConfig = {
-        ...config,
-        [key]: {
-          ...currentApp,
-          enabled: true,
-          status: 'connected',
-          lastSyncedAt: new Date().toISOString(),
-          accountEmail: 'business@workspace.com',
-        },
-      };
-      onChange?.(updated);
+  const handleConnect = async (
+    key: GoogleWorkspaceUiKey,
+    appName: string
+  ) => {
+    const service = GOOGLE_WORKSPACE_SERVICE_MAP[key];
+    if (connectingService) {
+      return;
     }
 
-    toast.info('Google OAuth connect will be added soon.');
+    setConnectingService(service);
+
+    try {
+      const { authorizationUrl } = await startGoogleWorkspaceOAuth({
+        service,
+        workspaceId,
+        agentId,
+      });
+
+      // Redirect browser to Google OAuth authorization URL returned by the Edge Function
+      window.location.href = authorizationUrl;
+    } catch (err: any) {
+      setConnectingService(null);
+      const errMsg =
+        err?.message ||
+        `Could not start Google OAuth for ${appName}. Please try again.`;
+      toast.error(errMsg);
+    }
   };
 
-  const handleDisconnect = (key: 'gmail' | 'drive' | 'docs' | 'sheets' | 'calendar', appName: string) => {
-    if (key === 'sheets') {
-      const currentSheets: GoogleSheetToolConfig = config.sheets || {
-        enabled: false,
-        columns: [],
-        sheetName: 'Sheet1',
-      };
-      const updated: GoogleWorkspaceConfig = {
-        ...config,
-        sheets: {
-          ...currentSheets,
-          enabled: false,
-          status: 'disconnected',
-        },
-      };
-      onChange?.(updated);
-    } else {
-      const currentApp = config[key];
-      const updated: GoogleWorkspaceConfig = {
-        ...config,
-        [key]: {
-          ...currentApp,
-          enabled: false,
-          status: 'disconnected',
-        },
-      };
-      onChange?.(updated);
-    }
-
-    toast.success(`Disconnected from ${appName}`);
+  const handleDisconnect = (_key: GoogleWorkspaceUiKey, appName: string) => {
+    // The deployed `google_workspace` Edge Function currently supports only `action: "start"`.
+    // Do not perform an insecure direct deletion from the browser; preserve the real database state.
+    toast.info(
+      `Disconnecting ${appName} requires a backend disconnect action in the google_workspace Edge Function to revoke stored OAuth tokens.`
+    );
   };
 
   return (
@@ -187,7 +303,7 @@ export const GoogleWorkspaceSection: React.FC<GoogleWorkspaceSectionProps> = ({
                   </span>
                 ) : (
                   <span className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium text-muted-foreground border border-border">
-                    5 Tools Available
+                    {isLoadingStatus ? 'Checking status…' : '5 Tools Available'}
                   </span>
                 )}
               </div>
@@ -221,6 +337,9 @@ export const GoogleWorkspaceSection: React.FC<GoogleWorkspaceSectionProps> = ({
             <div className="grid grid-cols-1 gap-3">
               {apps.map((app) => {
                 const LogoComponent = app.logo;
+                const isThisConnecting = connectingService === app.service;
+                const isAnyConnecting = connectingService !== null;
+
                 return (
                   <div
                     key={app.key}
@@ -236,21 +355,43 @@ export const GoogleWorkspaceSection: React.FC<GoogleWorkspaceSectionProps> = ({
                           <span className="text-xs font-bold text-foreground">
                             {app.name}
                           </span>
-                          {app.isConnected && (
+                          {app.status === 'connected' && (
                             <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">
                               <CheckCircle2 className="size-2.5" />
                               <span>Active</span>
+                            </span>
+                          )}
+                          {app.status === 'expired' && (
+                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20">
+                              <AlertCircle className="size-2.5" />
+                              <span>Expired</span>
+                            </span>
+                          )}
+                          {app.status === 'error' && (
+                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-red-500/10 text-red-600 dark:text-red-400 border border-red-500/20">
+                              <AlertCircle className="size-2.5" />
+                              <span>Error</span>
+                            </span>
+                          )}
+                          {app.email && (
+                            <span className="text-[11px] font-medium text-muted-foreground">
+                              {app.email}
                             </span>
                           )}
                         </div>
                         <p className="text-[11px] text-muted-foreground leading-relaxed">
                           {app.description}
                         </p>
+                        {app.status === 'error' && app.lastError && (
+                          <p className="text-[11px] text-red-600 dark:text-red-400 mt-1">
+                            {app.lastError}
+                          </p>
+                        )}
                       </div>
                     </div>
 
                     <div className="flex items-center gap-2 self-start sm:self-center shrink-0 pt-1 sm:pt-0">
-                      {app.isConnected ? (
+                      {app.status === 'connected' ? (
                         <div className="flex items-center gap-2">
                           <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">
                             <CheckCircle2 className="size-3.5" />
@@ -264,14 +405,57 @@ export const GoogleWorkspaceSection: React.FC<GoogleWorkspaceSectionProps> = ({
                             Disconnect
                           </button>
                         </div>
+                      ) : app.status === 'expired' || app.status === 'error' ? (
+                        <div className="flex items-center gap-2">
+                          <span
+                            className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-semibold border ${
+                              app.status === 'expired'
+                                ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/20'
+                                : 'bg-red-500/10 text-red-600 dark:text-red-400 border-red-500/20'
+                            }`}
+                          >
+                            <AlertCircle className="size-3.5" />
+                            <span>
+                              {app.status === 'expired' ? 'Expired' : 'Error'}
+                            </span>
+                          </span>
+                          <button
+                            type="button"
+                            disabled={isAnyConnecting}
+                            onClick={() => handleConnect(app.key, app.name)}
+                            className="inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-600 px-4 py-2 text-xs font-semibold text-white hover:bg-emerald-700 active:bg-emerald-800 transition-colors shadow-xs cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
+                          >
+                            {isThisConnecting ? (
+                              <>
+                                <Loader2 className="size-3.5 animate-spin" />
+                                <span>Connecting…</span>
+                              </>
+                            ) : (
+                              <>
+                                <RefreshCw className="size-3.5" />
+                                <span>Reconnect to {app.name}</span>
+                              </>
+                            )}
+                          </button>
+                        </div>
                       ) : (
                         <button
                           type="button"
+                          disabled={isAnyConnecting}
                           onClick={() => handleConnect(app.key, app.name)}
-                          className="inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-600 px-4 py-2 text-xs font-semibold text-white hover:bg-emerald-700 active:bg-emerald-800 transition-colors shadow-xs cursor-pointer"
+                          className="inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-600 px-4 py-2 text-xs font-semibold text-white hover:bg-emerald-700 active:bg-emerald-800 transition-colors shadow-xs cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
                         >
-                          <LogoComponent className="size-3.5" />
-                          <span>Connect to {app.name}</span>
+                          {isThisConnecting ? (
+                            <>
+                              <Loader2 className="size-3.5 animate-spin" />
+                              <span>Connecting to {app.name}…</span>
+                            </>
+                          ) : (
+                            <>
+                              <LogoComponent className="size-3.5" />
+                              <span>Connect to {app.name}</span>
+                            </>
+                          )}
                         </button>
                       )}
                     </div>
@@ -285,3 +469,4 @@ export const GoogleWorkspaceSection: React.FC<GoogleWorkspaceSectionProps> = ({
     </div>
   );
 };
+

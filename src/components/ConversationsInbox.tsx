@@ -3,6 +3,7 @@ import { Agent, ChatMessage, Conversation, PlatformType } from '../types';
 import { apiFetch } from '../lib/api';
 import { AgentResponseRating } from './AgentResponseRating';
 import { TakeoverSlider } from './TakeoverSlider';
+import { TikTokLogo } from './BrandLogos';
 import {
   MessageSquare,
   Instagram,
@@ -110,58 +111,82 @@ export const ConversationsInbox: React.FC<ConversationsInboxProps> = ({ agent })
     }
   };
 
-  const handleMessageFeedback = async (messageId: string, rating: number, feedback: string) => {
-    if (!activeConv) return;
-    try {
-      const res = await apiFetch(`/api/conversations/${activeConv.id}/feedback`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messageId,
-          rating,
-          feedbackComment: feedback,
-        }),
-      });
-
-      const updatedMessages = activeConv.messages.map((m) =>
-        m.id === messageId
-          ? { ...m, rating, feedback, feedbackCreatedAt: new Date().toISOString() }
-          : m
-      );
-
-      const updatedConv: Conversation = {
-        ...activeConv,
-        messages: updatedMessages,
-      };
-
-      if (res.ok) {
-        const data = await res.json();
-        if (data.conversation) {
-          setConversations((prev) =>
-            prev.map((c) => (c.id === data.conversation.id ? data.conversation : c))
-          );
-          return;
-        }
-      }
-
-      setConversations((prev) =>
-        prev.map((c) => (c.id === updatedConv.id ? updatedConv : c))
-      );
-    } catch (err) {
-      console.error(err);
+  const handleMessageFeedback = async (
+    messageId: string,
+    rating: number,
+    feedback: string,
+    tags: string[] = []
+  ): Promise<void> => {
+    if (!activeConv) {
+      throw new Error('No active conversation selected.');
     }
+
+    const targetMsg = activeConv.messages.find((m) => m.id === messageId);
+
+    const res = await apiFetch(`/api/conversations/${activeConv.id}/feedback`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        agentId: activeConv.agentId || null,
+        messageId,
+        feedbackId: targetMsg?.feedbackId || null,
+        rating,
+        feedbackComment: feedback,
+        tags,
+      }),
+    });
+
+    const data = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+      throw new Error(
+        data?.error || `Failed to save feedback (HTTP ${res.status}).`
+      );
+    }
+
+    if (data?.conversation) {
+      setConversations((prev) =>
+        prev.map((c) => (c.id === data.conversation.id ? data.conversation : c))
+      );
+      return;
+    }
+
+    const savedFb = data?.feedback;
+    const updatedMessages = activeConv.messages.map((m) =>
+      m.id === messageId
+        ? {
+            ...m,
+            rating: savedFb?.rating ?? rating,
+            feedback: savedFb?.comment ?? feedback,
+            feedbackTags: Array.isArray(savedFb?.tags) ? savedFb.tags : tags,
+            feedbackId: savedFb?.id ?? m.feedbackId,
+            feedbackCreatedAt: savedFb?.created_at ?? new Date().toISOString(),
+          }
+        : m
+    );
+
+    const updatedConv: Conversation = {
+      ...activeConv,
+      messages: updatedMessages,
+    };
+
+    setConversations((prev) =>
+      prev.map((c) => (c.id === updatedConv.id ? updatedConv : c))
+    );
   };
 
   const renderPlatformIcon = (platform: PlatformType) => {
     switch (platform) {
-      case 'instagram':
-        return <Instagram className="w-4 h-4 text-[#E1306C]" />;
       case 'whatsapp':
         return <Phone className="w-4 h-4 text-[#25D366]" />;
-      case 'messenger':
-        return <Facebook className="w-4 h-4 text-[#0866FF]" />;
+      case 'instagram':
+        return <Instagram className="w-4 h-4 text-[#E1306C]" />;
+      case 'tiktok':
+        return <TikTokLogo className="w-4 h-4" />;
       case 'call':
         return <PhoneCall className="w-4 h-4 text-amber-500" />;
+      case 'messenger':
+        return <Facebook className="w-4 h-4 text-[#0866FF]" />;
     }
   };
 
@@ -182,18 +207,25 @@ export const ConversationsInbox: React.FC<ConversationsInboxProps> = ({ agent })
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
-          {['all', 'instagram', 'whatsapp', 'messenger', 'call'].map((p) => (
+        <div className="flex items-center gap-2 flex-wrap">
+          {[
+            { key: 'all', label: 'All' },
+            { key: 'whatsapp', label: 'WhatsApp' },
+            { key: 'instagram', label: 'Instagram' },
+            { key: 'tiktok', label: 'TikTok' },
+            { key: 'call', label: 'Phone call' },
+            { key: 'messenger', label: 'Messenger' },
+          ].map((p) => (
             <button
-              key={p}
-              onClick={() => setFilterPlatform(p)}
-              className={`px-3 py-1.5 rounded-xl text-xs font-semibold capitalize transition-all ${
-                filterPlatform === p
+              key={p.key}
+              onClick={() => setFilterPlatform(p.key)}
+              className={`px-3 py-1.5 rounded-xl text-xs font-semibold transition-all ${
+                filterPlatform === p.key
                   ? 'bg-neutral-900 text-white shadow-2xs'
                   : 'bg-neutral-100 text-neutral-600 hover:bg-neutral-200'
               }`}
             >
-              {p}
+              {p.label}
             </button>
           ))}
         </div>
@@ -386,6 +418,7 @@ export const ConversationsInbox: React.FC<ConversationsInboxProps> = ({ agent })
                           messageText={msg.text}
                           rating={msg.rating}
                           feedback={msg.feedback}
+                          feedbackTags={msg.feedbackTags}
                           feedbackCreatedAt={msg.feedbackCreatedAt}
                           onUpdateFeedback={handleMessageFeedback}
                           align="right"

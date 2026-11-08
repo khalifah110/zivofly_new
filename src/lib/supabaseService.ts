@@ -1,86 +1,249 @@
-import { supabase, isSupabaseConfigured } from './supabaseClient';
-import { Agent, ChannelConnection, Conversation, KnowledgeDocument, User, ChatMessage } from '../types';
+import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY } from './supabaseClient';
+import {
+  Agent,
+  ChannelConnection,
+  Conversation,
+  KnowledgeDocument,
+  User,
+  ChatMessage,
+  GoogleWorkspaceConfig,
+  GoogleWorkspaceIntegrationStatus,
+  GoogleWorkspaceServiceIdentifier,
+} from '../types';
+import { isCorruptedDocxText } from './fileTextExtractor';
+
+export const CONFIG_DOC_TITLE = '__agent_extended_config__';
+
+// Cache workspaceId per userId in memory to minimize redundant round-trips
+const workspaceCache = new Map<string, string>();
+
+// Guard to prevent duplicate concurrent processing of the same document
+const inFlightDocumentIds = new Set<string>();
 
 /**
- * Helper to map Supabase 'profiles' row to frontend User model
+ * Helper to map Supabase 'profiles' row + auth metadata to frontend User model
  */
-export function mapSupabaseProfileToUser(row: any, fallbackEmail?: string): User {
+export function mapSupabaseProfileToUser(row: any, authUser?: any, fallbackEmail?: string): User {
+  const email = row?.email || authUser?.email || fallbackEmail || '';
+  const meta = authUser?.user_metadata || {};
   return {
-    id: row?.id || '',
-    name: row?.full_name || row?.name || row?.display_name || fallbackEmail?.split('@')[0] || 'User',
-    email: row?.email || fallbackEmail || '',
-    businessName: row?.business_name || row?.company_name || 'My Business',
-    avatarUrl: row?.avatar_url || row?.avatar || undefined,
+    id: row?.id || authUser?.id || '',
+    name:
+      row?.full_name ||
+      meta?.full_name ||
+      meta?.name ||
+      email.split('@')[0] ||
+      'User',
+    email,
+    businessName: row?.business_name || meta?.business_name || 'My Business',
+    avatarUrl: row?.avatar_url || meta?.avatar_url || meta?.picture || undefined,
   };
 }
 
 /**
- * Helper to map Supabase 'agents' row to frontend Agent model
+ * Ensure the authenticated user has a row in `profiles` and a workspace in `workspaces` + `workspace_members`.
+ * Returns the workspace UUID for this user.
  */
-export function mapSupabaseAgentToFrontend(row: any): Agent {
+export async function getOrCreateUserWorkspace(
+  userId: string,
+  userEmail?: string,
+  userName?: string,
+  businessName?: string
+): Promise<string> {
+  if (!supabase) throw new Error('Supabase client is not configured.');
+
+  const cached = workspaceCache.get(userId);
+  if (cached) return cached;
+
+  // 1. Check workspaces owned by this user
+  const { data: ownedWs } = await supabase
+    .from('workspaces')
+    .select('id')
+    .eq('owner_user_id', userId)
+    .order('created_at', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+
+  if (ownedWs?.id) {
+    workspaceCache.set(userId, ownedWs.id);
+    return ownedWs.id;
+  }
+
+  // 2. Check workspace_members for this user
+  const { data: memberWs } = await supabase
+    .from('workspace_members')
+    .select('workspace_id')
+    .eq('user_id', userId)
+    .limit(1)
+    .maybeSingle();
+
+  if (memberWs?.workspace_id) {
+    workspaceCache.set(userId, memberWs.workspace_id);
+    return memberWs.workspace_id;
+  }
+
+  // 3. Ensure profile exists before creating workspace (in case FK references profiles)
+  try {
+    const { data: existingProfile } = await supabase
+      .from('profiles')
+      .select('id')
+      .eq('id', userId)
+      .maybeSingle();
+
+    if (!existingProfile) {
+      await supabase.from('profiles').upsert(
+        {
+          id: userId,
+          email: userEmail || '',
+          full_name: userName || userEmail?.split('@')[0] || 'User',
+          business_name: businessName || 'My Business',
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'id' }
+      );
+    }
+  } catch (e) {
+    console.warn('[Zivofly] Profile ensure warning:', e);
+  }
+
+  // 4. Create a new workspace for this real user
+  const wsName = businessName || (userName ? `${userName}'s Workspace` : 'My Workspace');
+  const { data: createdWs, error: wsError } = await supabase
+    .from('workspaces')
+    .insert({
+      owner_user_id: userId,
+      name: wsName,
+      status: 'active',
+    })
+    .select('id')
+    .single();
+
+  if (wsError || !createdWs?.id) {
+    throw wsError || new Error('Failed to provision user workspace in Supabase');
+  }
+
+  // 5. Link user in workspace_members
+  try {
+    await supabase.from('workspace_members').insert({
+      workspace_id: createdWs.id,
+      user_id: userId,
+      member_role: 'owner',
+    });
+  } catch (e) {
+    console.warn('[Zivofly] workspace_members insert warning:', e);
+  }
+
+  workspaceCache.set(userId, createdWs.id);
+  return createdWs.id;
+}
+
+/**
+ * Helper to map a single Supabase 'knowledge_documents' row to frontend KnowledgeDocument model
+ */
+export function mapSupabaseKnowledgeDocToFrontend(d: any): KnowledgeDocument {
+  const rawContent =
+    typeof d.content_text === 'string' && d.content_text.length > 0
+      ? d.content_text
+      : d.metadata?.content || '';
+  const byteSize =
+    typeof d.file_size_bytes === 'number'
+      ? d.file_size_bytes
+      : new TextEncoder().encode(rawContent).length;
+  const formattedSize =
+    d.metadata?.fileSize ||
+    `${Math.max(1, Math.round(byteSize / 1024))} KB`;
+
+  const sourceType = d.source_type || 'text';
+  const docType: KnowledgeDocument['type'] =
+    sourceType === 'file' || d.mime_type === 'application/pdf' || d.metadata?.type === 'pdf'
+      ? 'pdf'
+      : sourceType === 'faq'
+      ? 'faq'
+      : sourceType === 'meta_bio'
+      ? 'social_bio'
+      : 'text';
+
+  const rawChunkCount = typeof d.chunk_count === 'number' ? d.chunk_count : 0;
+  // A document must only be shown as 'ready' when its chunks and embeddings have been saved (chunk_count > 0)
+  const effectiveStatus: KnowledgeDocument['status'] =
+    d.status === 'ready' && rawChunkCount > 0
+      ? 'ready'
+      : d.status === 'ready' && rawChunkCount === 0
+      ? 'queued'
+      : d.status || 'queued';
+
+  return {
+    id: d.id,
+    workspaceId: d.workspace_id,
+    agentId: d.agent_id,
+    name: d.title || 'Document',
+    type: docType,
+    sourceType,
+    content: rawContent,
+    mimeType: d.mime_type || 'text/plain',
+    fileSizeBytes: byteSize,
+    chunkCount: rawChunkCount,
+    status: effectiveStatus,
+    errorMessage: d.error_message || null,
+    createdAt: d.created_at || new Date().toISOString(),
+    updatedAt: d.updated_at || d.created_at || new Date().toISOString(),
+    fileSize: formattedSize,
+  };
+}
+
+/**
+ * Helper to map Supabase 'agents' row + knowledge_documents rows to frontend Agent model
+ */
+export function mapSupabaseAgentToFrontend(row: any, docRows: any[] = [], userId = ''): Agent {
+  const configDoc = docRows.find((d) => d.title === CONFIG_DOC_TITLE);
+  const ext = configDoc?.metadata || {};
+
+  const knowledgeDocs: KnowledgeDocument[] = docRows
+    .filter((d) => d.title !== CONFIG_DOC_TITLE && d.status !== 'deleted')
+    .map((d) => mapSupabaseKnowledgeDocToFrontend(d));
+
+  const activeDays = Array.isArray(row.active_days)
+    ? row.active_days
+    : [0, 1, 2, 3, 4, 5, 6];
+
   return {
     id: row.id,
-    userId: row.user_id || row.userId || '',
+    userId: row.created_by || userId || '',
+    workspaceId: row.workspace_id || undefined,
     name: row.name || 'AI Concierge',
-    description: row.description || '',
-    platforms: row.platforms || (row.channel ? [row.channel] : ['instagram']),
-    roleAndDuties: row.role_and_duties || row.roleAndDuties || row.instructions || '',
-    openingLine: row.opening_line || row.openingLine,
-    tone: row.tone,
-    status: row.status || 'active',
-    customVoice: row.custom_voice || row.customVoice,
-    availability: row.availability || {
-      is24x7: true,
-      timezone: 'America/New_York',
-      startHour: '08:00',
-      endHour: '20:00',
-      activeDays: [1, 2, 3, 4, 5, 6, 7],
+    description: ext.shortDescription ?? row.description ?? '',
+    platforms: Array.isArray(ext.platforms) ? ext.platforms : ['whatsapp', 'instagram'],
+    roleAndDuties: ext.roleAndDuties ?? row.description ?? '',
+    openingLine: row.greeting || ext.openingLine || '',
+    tone: row.tone || '',
+    status: row.status === 'paused' ? 'paused' : 'active',
+    customVoice: ext.customVoice,
+    availability: {
+      is24x7: row.always_on ?? true,
+      timezone: row.timezone || 'America/New_York',
+      startHour: row.active_from ? String(row.active_from).slice(0, 5) : '08:00',
+      endHour: row.active_to ? String(row.active_to).slice(0, 5) : '20:00',
+      activeDays,
     },
-    platformConfig: row.platform_config || row.platformConfig || {},
-    whatItRepliesTo: row.what_it_replies_to || row.whatItRepliesTo,
-    knowledgeDocs: row.knowledge_docs || row.knowledgeDocs || [],
-    tools: row.tools || row.agent_tools,
+    platformConfig: ext.platformConfig || {},
+    whatItRepliesTo: ext.whatItRepliesTo,
+    knowledgeDocs,
+    tools: ext.tools,
     createdAt: row.created_at || new Date().toISOString(),
     updatedAt: row.updated_at || new Date().toISOString(),
   };
 }
 
 /**
- * Helper to map frontend Agent to Supabase 'agents' insert/update payload
- */
-export function mapFrontendAgentToSupabase(agent: Partial<Agent>, userId: string) {
-  const payload: Record<string, any> = {};
-
-  if (agent.id) payload.id = agent.id;
-  payload.user_id = userId;
-  if (agent.name !== undefined) payload.name = agent.name;
-  if (agent.description !== undefined) payload.description = agent.description;
-  if (agent.platforms !== undefined) payload.platforms = agent.platforms;
-  if (agent.roleAndDuties !== undefined) payload.role_and_duties = agent.roleAndDuties;
-  if (agent.openingLine !== undefined) payload.opening_line = agent.openingLine;
-  if (agent.tone !== undefined) payload.tone = agent.tone;
-  if (agent.status !== undefined) payload.status = agent.status;
-  if (agent.customVoice !== undefined) payload.custom_voice = agent.customVoice;
-  if (agent.availability !== undefined) payload.availability = agent.availability;
-  if (agent.platformConfig !== undefined) payload.platform_config = agent.platformConfig;
-  if (agent.whatItRepliesTo !== undefined) payload.what_it_replies_to = agent.whatItRepliesTo;
-  if (agent.knowledgeDocs !== undefined) payload.knowledge_docs = agent.knowledgeDocs;
-  if (agent.tools !== undefined) payload.tools = agent.tools;
-  payload.updated_at = new Date().toISOString();
-
-  return payload;
-}
-
-/**
  * Helper to map Supabase 'channel_connections' row to frontend ChannelConnection model
  */
-export function mapSupabaseConnectionToFrontend(row: any): ChannelConnection {
+export function mapSupabaseConnectionToFrontend(row: any, userId = ''): ChannelConnection {
   return {
     id: row.id,
-    user_id: row.user_id || '',
+    user_id: userId || row.workspace_id || '',
     agent_id: row.agent_id || null,
     channel: row.channel,
-    display_name: row.display_name || row.displayName || `${row.channel} Connection`,
+    display_name: row.display_name || row.business_name || `${row.channel} Connection`,
     handle: row.handle || '',
     status: row.status || 'connected',
     reply_dms: row.reply_dms ?? true,
@@ -89,8 +252,8 @@ export function mapSupabaseConnectionToFrontend(row: any): ChannelConnection {
     comment_keywords: row.comment_keywords || [],
     tag_accounts: row.tag_accounts || [],
     always_on: row.always_on ?? true,
-    active_from: row.active_from || '08:00',
-    active_to: row.active_to || '20:00',
+    active_from: row.active_from ? String(row.active_from).slice(0, 5) : '08:00',
+    active_to: row.active_to ? String(row.active_to).slice(0, 5) : '20:00',
     active_days: row.active_days || [1, 2, 3, 4, 5, 6, 7],
     timezone: row.timezone || 'America/New_York',
     created_at: row.created_at || new Date().toISOString(),
@@ -109,13 +272,16 @@ export async function signUpWithSupabase(
 ): Promise<{ user: User; session: any } | null> {
   if (!supabase) throw new Error('Supabase client is not configured.');
 
+  const fullName = metadata?.name?.trim() || email.split('@')[0];
+  const businessName = metadata?.businessName?.trim() || 'My Business';
+
   const { data, error } = await supabase.auth.signUp({
     email,
     password,
     options: {
       data: {
-        full_name: metadata?.name || '',
-        business_name: metadata?.businessName || '',
+        full_name: fullName,
+        business_name: businessName,
       },
     },
   });
@@ -123,44 +289,38 @@ export async function signUpWithSupabase(
   if (error) throw error;
   if (!data.user) throw new Error('Sign up did not return a user identity.');
 
-  // Check if profile exists, or create it if not created by database trigger
   let userProfile: User = {
     id: data.user.id,
     email: data.user.email || email,
-    name: metadata?.name || email.split('@')[0],
-    businessName: metadata?.businessName || 'My Business',
+    name: fullName,
+    businessName,
   };
 
-  try {
-    const { data: existingProfile } = await supabase
-      .from('profiles')
-      .select('*')
-      .eq('id', data.user.id)
-      .maybeSingle();
-
-    if (existingProfile) {
-      userProfile = mapSupabaseProfileToUser(existingProfile, email);
-    } else {
-      // Create profile row
-      const { data: insertedProfile } = await supabase
+  if (data.session) {
+    try {
+      const { data: upsertedProfile } = await supabase
         .from('profiles')
-        .insert({
-          id: data.user.id,
-          email: data.user.email || email,
-          full_name: metadata?.name || email.split('@')[0],
-          business_name: metadata?.businessName || 'My Business',
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        })
+        .upsert(
+          {
+            id: data.user.id,
+            email: data.user.email || email,
+            full_name: fullName,
+            business_name: businessName,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'id' }
+        )
         .select('*')
         .maybeSingle();
 
-      if (insertedProfile) {
-        userProfile = mapSupabaseProfileToUser(insertedProfile, email);
+      if (upsertedProfile) {
+        userProfile = mapSupabaseProfileToUser(upsertedProfile, data.user, email);
       }
+
+      await getOrCreateUserWorkspace(data.user.id, email, fullName, businessName);
+    } catch (profErr) {
+      console.warn('[Zivofly] Profile/workspace setup after signup warning:', profErr);
     }
-  } catch (profErr) {
-    console.warn('[Zivofly] Profile query error after signup:', profErr);
   }
 
   return { user: userProfile, session: data.session };
@@ -180,21 +340,25 @@ export async function signInWithSupabase(
   if (error) throw error;
   if (!data.user) throw new Error('Sign in failed to retrieve user account.');
 
-  // Retrieve user's profile
-  let profile = await getSupabaseProfile(data.user.id);
-  if (!profile) {
-    profile = {
-      id: data.user.id,
-      email: data.user.email || email,
-      name: data.user.user_metadata?.full_name || email.split('@')[0],
-      businessName: data.user.user_metadata?.business_name || 'My Business',
-    };
+  const profile = await getSupabaseProfile(data.user.id);
+  const finalUser: User = profile || mapSupabaseProfileToUser(null, data.user, email);
+
+  try {
+    await getOrCreateUserWorkspace(
+      data.user.id,
+      finalUser.email,
+      finalUser.name,
+      finalUser.businessName
+    );
+  } catch (wsErr) {
+    console.warn('[Zivofly] Workspace ensure on sign-in warning:', wsErr);
   }
 
-  return { user: profile, session: data.session };
+  return { user: finalUser, session: data.session };
 }
 
 export async function signOutFromSupabase(): Promise<void> {
+  workspaceCache.clear();
   if (!supabase) return;
   await supabase.auth.signOut();
 }
@@ -210,12 +374,7 @@ export async function getSupabaseSession(): Promise<{ user: User | null; session
     const profile = await getSupabaseProfile(authUser.id);
 
     return {
-      user: profile || {
-        id: authUser.id,
-        email: authUser.email || '',
-        name: authUser.user_metadata?.full_name || authUser.email?.split('@')[0] || 'User',
-        businessName: authUser.user_metadata?.business_name || 'My Business',
-      },
+      user: profile || mapSupabaseProfileToUser(null, authUser),
       session: data.session,
     };
   } catch (err) {
@@ -228,15 +387,16 @@ export async function getSupabaseProfile(userId?: string): Promise<User | null> 
   if (!supabase) return null;
 
   try {
-    let targetId = userId;
-    let authEmail: string | undefined;
+    const { data: sessionData } = await supabase.auth.getSession();
+    let authUser = sessionData?.session?.user || null;
 
-    if (!targetId) {
+    if (!authUser) {
       const { data: authData } = await supabase.auth.getUser();
-      if (!authData?.user) return null;
-      targetId = authData.user.id;
-      authEmail = authData.user.email;
+      authUser = authData?.user || null;
     }
+
+    const targetId = userId || authUser?.id;
+    if (!targetId) return null;
 
     const { data, error } = await supabase
       .from('profiles')
@@ -246,11 +406,56 @@ export async function getSupabaseProfile(userId?: string): Promise<User | null> 
 
     if (error) {
       console.warn('[Zivofly] Profile query returned error:', error.message);
-      return null;
     }
 
-    if (!data) return null;
-    return mapSupabaseProfileToUser(data, authEmail);
+    if (data) {
+      // Ensure workspace is also ready in the background
+      getOrCreateUserWorkspace(
+        targetId,
+        data.email || authUser?.email,
+        data.full_name,
+        data.business_name
+      ).catch(() => {});
+      return mapSupabaseProfileToUser(data, authUser);
+    }
+
+    // If the user is authenticated in Supabase Auth but has no row in `profiles` yet, create it now!
+    if (authUser && authUser.id === targetId) {
+      const fallbackUser = mapSupabaseProfileToUser(null, authUser);
+      try {
+        const { data: inserted } = await supabase
+          .from('profiles')
+          .upsert(
+            {
+              id: authUser.id,
+              email: fallbackUser.email,
+              full_name: fallbackUser.name,
+              business_name: fallbackUser.businessName || 'My Business',
+              avatar_url: fallbackUser.avatarUrl || null,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: 'id' }
+          )
+          .select('*')
+          .maybeSingle();
+
+        await getOrCreateUserWorkspace(
+          authUser.id,
+          fallbackUser.email,
+          fallbackUser.name,
+          fallbackUser.businessName
+        );
+
+        if (inserted) {
+          return mapSupabaseProfileToUser(inserted, authUser);
+        }
+      } catch (upsertErr) {
+        console.warn('[Zivofly] Auto-create profile row warning:', upsertErr);
+      }
+      return fallbackUser;
+    }
+
+    return null;
   } catch (err) {
     console.warn('[Zivofly] Failed to fetch profile from Supabase:', err);
     return null;
@@ -260,7 +465,12 @@ export async function getSupabaseProfile(userId?: string): Promise<User | null> 
 export async function updateSupabaseProfile(userId: string, updates: Partial<User>): Promise<User | null> {
   if (!supabase) return null;
 
+  const { data: sessionData } = await supabase.auth.getSession();
+  const authUser = sessionData?.session?.user;
+
   const payload: Record<string, any> = {
+    id: userId,
+    email: updates.email || authUser?.email || '',
     updated_at: new Date().toISOString(),
   };
 
@@ -270,13 +480,12 @@ export async function updateSupabaseProfile(userId: string, updates: Partial<Use
 
   const { data, error } = await supabase
     .from('profiles')
-    .update(payload)
-    .eq('id', userId)
+    .upsert(payload, { onConflict: 'id' })
     .select('*')
     .maybeSingle();
 
   if (error) throw error;
-  return data ? mapSupabaseProfileToUser(data) : null;
+  return data ? mapSupabaseProfileToUser(data, authUser) : null;
 }
 
 export async function deleteSupabaseAccount(): Promise<void> {
@@ -287,30 +496,606 @@ export async function deleteSupabaseAccount(): Promise<void> {
   if (!userId) return;
 
   try {
-    // Delete user data across tables adhering to RLS
-    await supabase.from('conversations').delete().eq('user_id', userId);
-    await supabase.from('channel_connections').delete().eq('user_id', userId);
-    await supabase.from('agents').delete().eq('user_id', userId);
+    const workspaceId = await getOrCreateUserWorkspace(userId).catch(() => null);
+    if (workspaceId) {
+      await supabase.from('messages').delete().eq('workspace_id', workspaceId);
+      await supabase.from('conversations').delete().eq('workspace_id', workspaceId);
+      await supabase.from('knowledge_documents').delete().eq('workspace_id', workspaceId);
+      await supabase.from('channel_connections').delete().eq('workspace_id', workspaceId);
+      await supabase.from('notifications').delete().eq('workspace_id', workspaceId);
+      await supabase.from('agents').delete().eq('workspace_id', workspaceId);
+      await supabase.from('workspace_members').delete().eq('workspace_id', workspaceId);
+      await supabase.from('workspaces').delete().eq('id', workspaceId);
+    }
     await supabase.from('profiles').delete().eq('id', userId);
   } catch (err) {
     console.warn('[Zivofly] Error deleting user related records:', err);
   }
 
-  // Sign out
+  workspaceCache.clear();
   await supabase.auth.signOut();
 }
 
 // ==========================================
-// AGENTS METHODS
+// AGENTS & KNOWLEDGE DOCUMENTS METHODS
 // ==========================================
+
+async function syncAgentExtendedConfigAndDocs(
+  workspaceId: string,
+  agentId: string,
+  agentData: Partial<Agent>
+): Promise<any[]> {
+  if (!supabase) return [];
+
+  const extMetadata = {
+    shortDescription: agentData.description || '',
+    roleAndDuties: agentData.roleAndDuties || agentData.description || '',
+    openingLine: agentData.openingLine || '',
+    platforms: agentData.platforms || ['whatsapp', 'instagram'],
+    customVoice: agentData.customVoice,
+    platformConfig: agentData.platformConfig || {},
+    whatItRepliesTo: agentData.whatItRepliesTo,
+    tools: agentData.tools,
+  };
+
+  const { data: existingDocs } = await supabase
+    .from('knowledge_documents')
+    .select('*')
+    .eq('agent_id', agentId);
+
+  const docsList = existingDocs || [];
+  const existingConfig = docsList.find((d) => d.title === CONFIG_DOC_TITLE);
+
+  if (existingConfig) {
+    await supabase
+      .from('knowledge_documents')
+      .update({
+        metadata: { ...(existingConfig.metadata || {}), ...extMetadata },
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', existingConfig.id);
+  } else {
+    await supabase.from('knowledge_documents').insert({
+      workspace_id: workspaceId,
+      agent_id: agentId,
+      title: CONFIG_DOC_TITLE,
+      source_type: 'other',
+      content_text: '',
+      mime_type: 'application/json',
+      file_size_bytes: 0,
+      storage_path: `agents/${agentId}/config.json`,
+      chunk_count: 0,
+      status: 'ready',
+      metadata: extMetadata,
+    });
+  }
+
+  // Sync user knowledgeDocs if provided
+  if (Array.isArray(agentData.knowledgeDocs)) {
+    const currentRealDocs = docsList.filter((d) => d.title !== CONFIG_DOC_TITLE);
+    const incomingDocs = agentData.knowledgeDocs;
+
+    // Delete removed docs
+    const incomingIds = new Set(incomingDocs.map((d) => d.id));
+    for (const oldDoc of currentRealDocs) {
+      if (!incomingIds.has(oldDoc.id)) {
+        // Delete associated chunks first, then the document
+        await supabase
+          .from('knowledge_chunks')
+          .delete()
+          .eq('document_id', oldDoc.id)
+          .eq('workspace_id', workspaceId);
+
+        const { error: delErr } = await supabase
+          .from('knowledge_documents')
+          .delete()
+          .eq('id', oldDoc.id)
+          .eq('workspace_id', workspaceId);
+        if (delErr) {
+          throw delErr;
+        }
+      }
+    }
+
+    // Insert newly added docs (ones not yet in currentRealDocs)
+    const existingIds = new Set(currentRealDocs.map((d) => d.id));
+    for (const doc of incomingDocs) {
+      if (!existingIds.has(doc.id)) {
+        const contentText = doc.content || '';
+        const fileSizeBytes =
+          typeof doc.fileSizeBytes === 'number'
+            ? doc.fileSizeBytes
+            : new TextEncoder().encode(contentText).length;
+        const sourceType =
+          doc.sourceType ||
+          (doc.type === 'pdf'
+            ? 'file'
+            : doc.type === 'faq'
+            ? 'faq'
+            : doc.type === 'social_bio'
+            ? 'meta_bio'
+            : 'text');
+
+        const { data: insertedDoc, error: insertErr } = await supabase
+          .from('knowledge_documents')
+          .insert({
+            workspace_id: workspaceId,
+            agent_id: agentId,
+            title: (doc.name || 'Document').trim(),
+            source_type: sourceType,
+            storage_path: null,
+            source_url: null,
+            content_text: contentText,
+            mime_type: doc.mimeType || (doc.type === 'pdf' ? 'application/pdf' : 'text/plain'),
+            file_size_bytes: fileSizeBytes,
+            chunk_count: 0,
+            status: 'queued',
+            error_message: null,
+            metadata: {
+              fileSize: doc.fileSize || `${Math.max(1, Math.round(fileSizeBytes / 1024))} KB`,
+              type: doc.type || 'text',
+            },
+          })
+          .select('*')
+          .single();
+
+        if (insertErr) {
+          throw insertErr;
+        }
+
+        if (insertedDoc?.id) {
+          try {
+            await processKnowledgeDocument({
+              workspaceId,
+              agentId,
+              documentId: insertedDoc.id,
+            });
+          } catch {
+            // Processing failure is recorded on the document row (status = 'failed', error_message)
+          }
+        }
+      }
+    }
+  }
+
+  const { data: refreshedDocs } = await supabase
+    .from('knowledge_documents')
+    .select('*')
+    .eq('agent_id', agentId)
+    .order('created_at', { ascending: true });
+
+  return refreshedDocs || [];
+}
+
+export interface EdgeFunctionDiagnosticError {
+  status: number | string;
+  stage?: string;
+  message: string;
+  formatted: string;
+}
+
+/**
+ * Extracts the exact HTTP status code, stage, and safe error message from a Supabase Functions error.
+ * Never logs or exposes tokens or secrets.
+ */
+export async function extractEdgeFunctionDiagnosticError(
+  edgeError: any,
+  fallbackServerError?: string | null
+): Promise<EdgeFunctionDiagnosticError> {
+  const ctx: any = edgeError?.context;
+  const status: number | string =
+    ctx?.status || edgeError?.status || edgeError?.statusCode || 'ERROR';
+  let stage: string | undefined;
+  let detailedMessage: string =
+    edgeError?.message || 'Edge Function invocation failed.';
+
+  if (ctx && typeof ctx.text === 'function') {
+    try {
+      const rawBody =
+        typeof ctx.clone === 'function'
+          ? await ctx.clone().text()
+          : await ctx.text();
+      if (rawBody && rawBody.trim()) {
+        try {
+          const parsed = JSON.parse(rawBody);
+          stage = typeof parsed.stage === 'string' ? parsed.stage : undefined;
+          detailedMessage =
+            parsed.error ||
+            parsed.message ||
+            parsed.details ||
+            parsed.msg ||
+            rawBody;
+        } catch {
+          detailedMessage = rawBody.trim();
+        }
+      }
+    } catch {
+      // Keep default edgeError.message
+    }
+  }
+
+  if (
+    detailedMessage === 'Edge Function returned a non-2xx status code' &&
+    fallbackServerError
+  ) {
+    detailedMessage = fallbackServerError;
+  }
+
+  const normalizedMessage =
+    typeof detailedMessage === 'string'
+      ? detailedMessage
+      : JSON.stringify(detailedMessage);
+
+  const stageLabel = stage ? ` [${stage}]` : '';
+  const statusPrefix =
+    normalizedMessage.startsWith('HTTP ')
+      ? ''
+      : `HTTP ${status}${stageLabel}: `;
+
+  return {
+    status,
+    stage,
+    message: normalizedMessage,
+    formatted: `${statusPrefix}${normalizedMessage}`,
+  };
+}
+
+/**
+ * Verifies the user has an active, non-expired authenticated Supabase session,
+ * refreshes the session if expired or rejected by auth.getUser(), and sets the
+ * user's JWT on the singleton Supabase Functions client.
+ * Never logs or exposes the actual access_token.
+ */
+export async function getVerifiedSupabaseAccessToken(): Promise<{
+  accessToken: string;
+  userId: string;
+}> {
+  if (!supabase || !SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    throw new Error(
+      'HTTP 500 [client_config]: Supabase client URL or publishable/anon key is not configured.'
+    );
+  }
+
+  const { data: sessionData, error: sessionErr } = await supabase.auth.getSession();
+  let session = sessionData?.session ?? null;
+
+  const isExpiringOrMissing =
+    !session?.access_token ||
+    (typeof session.expires_at === 'number' &&
+      session.expires_at * 1000 < Date.now() + 60_000);
+
+  if (isExpiringOrMissing) {
+    const { data: refreshed, error: refreshErr } =
+      await supabase.auth.refreshSession();
+    if (!refreshErr && refreshed?.session?.access_token) {
+      session = refreshed.session;
+    }
+  }
+
+  if (sessionErr || !session?.access_token || !session?.user?.id) {
+    throw new Error(
+      `HTTP 401 [frontend_session]: ${
+        sessionErr?.message ||
+        'Authentication required: No active authenticated Supabase session found. Please log in.'
+      }`
+    );
+  }
+
+  // Verify the JWT against Supabase Auth and refresh once if the token was invalidated server-side
+  const { data: userCheck, error: userCheckErr } = await supabase.auth.getUser(
+    session.access_token
+  );
+  if (userCheckErr || !userCheck?.user?.id) {
+    const { data: refreshed, error: refreshErr } =
+      await supabase.auth.refreshSession();
+    if (refreshErr || !refreshed?.session?.access_token || !refreshed?.session?.user?.id) {
+      throw new Error(
+        `HTTP 401 [auth_token_expired]: ${
+          userCheckErr?.message ||
+          refreshErr?.message ||
+          'Your login session has expired. Please sign out and sign in again.'
+        }`
+      );
+    }
+    session = refreshed.session;
+  }
+
+  const accessToken = session.access_token.trim();
+  if (!accessToken || accessToken === SUPABASE_ANON_KEY) {
+    throw new Error(
+      'HTTP 401 [invalid_user_jwt]: Authenticated user access_token is missing or matches the anonymous key.'
+    );
+  }
+
+  // Ensure the singleton FunctionsClient uses the verified user JWT
+  supabase.functions.setAuth(accessToken);
+
+  return {
+    accessToken,
+    userId: session.user.id,
+  };
+}
+
+/**
+/**
+ * Processes a knowledge_documents record by invoking the deployed `zivofy_ai` Supabase Edge Function:
+ * 1. Verifies authenticated session (`getVerifiedSupabaseAccessToken`), workspace_id, agent_id, and document_id ownership.
+ * 2. Transitions UI state to 'processing'.
+ * 3. Invokes `supabase.functions.invoke("zivofy_ai", { body: { action: "process_document", workspace_id, agent_id, document_id }, headers: { Authorization: "Bearer <accessToken>" } })`.
+ * 4. Never sends a `message` field and never inserts `knowledge_chunks` from the browser.
+ * 5. Only shows `Ready` when the Edge Function returns success and confirms `status: "ready"` with a positive chunk count (`chunk_count > 0`).
+ * 6. If any step fails, surfaces the actual Edge Function error (including stage and HTTP status).
+ */
+export async function processKnowledgeDocument(params: {
+  workspaceId: string;
+  agentId: string;
+  documentId: string;
+  onStatusChange?: (doc: KnowledgeDocument) => void;
+}): Promise<KnowledgeDocument> {
+  const { workspaceId, agentId, documentId, onStatusChange } = params;
+
+  if (!supabase) {
+    throw new Error('Supabase client is not configured.');
+  }
+
+  if (inFlightDocumentIds.has(documentId)) {
+    throw new Error('This document is already being processed. Please wait.');
+  }
+
+  inFlightDocumentIds.add(documentId);
+
+  try {
+    // 1. Verify active authenticated session & ensure fresh user JWT (never log the JWT)
+    const { accessToken, userId } = await getVerifiedSupabaseAccessToken();
+
+    // 2. Verify agent belongs to workspace
+    const { data: agentRow, error: agentErr } = await supabase
+      .from('agents')
+      .select('id, workspace_id')
+      .eq('id', agentId)
+      .eq('workspace_id', workspaceId)
+      .maybeSingle();
+
+    if (agentErr || !agentRow) {
+      throw new Error(
+        `HTTP 404 [agent_lookup]: ${
+          agentErr?.message ||
+          `Agent (${agentId}) does not belong to workspace (${workspaceId}).`
+        }`
+      );
+    }
+
+    // 3. Load and verify the knowledge_documents row
+    const { data: docRow, error: docErr } = await supabase
+      .from('knowledge_documents')
+      .select('*')
+      .eq('id', documentId)
+      .eq('workspace_id', workspaceId)
+      .eq('agent_id', agentId)
+      .maybeSingle();
+
+    if (docErr || !docRow) {
+      throw new Error(
+        `HTTP 404 [document_lookup]: ${
+          docErr?.message ||
+          `Knowledge document (${documentId}) not found for the selected workspace and agent.`
+        }`
+      );
+    }
+
+    const contentText = (
+      docRow.content_text ||
+      docRow.metadata?.content ||
+      ''
+    ).trim();
+
+    if (!contentText) {
+      throw new Error(
+        'HTTP 400 [empty_content]: Document content_text is empty and cannot be processed.'
+      );
+    }
+
+    if (isCorruptedDocxText(contentText)) {
+      throw new Error(
+        'HTTP 400 [corrupted_docx]: Document content_text contains corrupted DOCX XML/ZIP metadata (Content_Types, document.xml, styles.xml). Please re-upload the Word (.docx) file or edit the document content before retrying.'
+      );
+    }
+
+    // 4. Transition UI state to 'processing' while the Edge Function executes
+    if (onStatusChange) {
+      onStatusChange({
+        ...mapSupabaseKnowledgeDocToFrontend(docRow),
+        status: 'processing',
+        errorMessage: null,
+      });
+    }
+
+    const requestBody = {
+      action: 'process_document',
+      workspace_id: workspaceId,
+      agent_id: agentId,
+      document_id: documentId,
+    };
+
+    console.info('[Knowledge Processor] Invoking zivofy_ai Edge Function:', {
+      supabaseUrl: SUPABASE_URL,
+      hasAnonKey: Boolean(SUPABASE_ANON_KEY),
+      hasUserAccessToken: Boolean(accessToken),
+      userId,
+      requestBody,
+    });
+
+    // 5. Invoke the deployed Supabase Edge Function `zivofy_ai`
+    const { data: edgeData, error: edgeError } = await supabase.functions.invoke(
+      'zivofy_ai',
+      {
+        body: {
+          action: 'process_document',
+          workspace_id: workspaceId,
+          agent_id: agentId,
+          document_id: documentId,
+        },
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+      }
+    );
+
+    if (edgeError) {
+      const diag = await extractEdgeFunctionDiagnosticError(edgeError);
+      console.error('[Knowledge Processor] zivofy_ai error:', {
+        status: diag.status,
+        stage: diag.stage || 'edge_function',
+        message: diag.message,
+        document_id: documentId,
+        workspace_id: workspaceId,
+        agent_id: agentId,
+      });
+      throw new Error(diag.formatted);
+    }
+
+    if (
+      edgeData?.error ||
+      edgeData?.ok === false ||
+      edgeData?.success === false
+    ) {
+      const status =
+        edgeData?.status_code ||
+        edgeData?.statusCode ||
+        edgeData?.httpStatus ||
+        (typeof edgeData?.status === 'number' ? edgeData.status : 400);
+      const stage = edgeData?.stage ? ` [${edgeData.stage}]` : '';
+      const rawErr =
+        edgeData?.error ||
+        edgeData?.message ||
+        edgeData?.details ||
+        'Document processing failed in Edge Function.';
+      const errDetail =
+        typeof rawErr === 'string' ? rawErr : JSON.stringify(rawErr);
+      const formattedErr = errDetail.startsWith('HTTP ')
+        ? errDetail
+        : `HTTP ${status}${stage}: ${errDetail}`;
+
+      console.error('[Knowledge Processor] zivofy_ai returned error payload:', {
+        status,
+        stage: edgeData?.stage || 'process_document',
+        message: formattedErr,
+        document_id: documentId,
+      });
+      throw new Error(formattedErr);
+    }
+
+    // 6. Reload the updated document from knowledge_documents to confirm persisted status & chunk_count
+    const { data: refreshedDocRow, error: refreshErr } = await supabase
+      .from('knowledge_documents')
+      .select('*')
+      .eq('id', documentId)
+      .eq('workspace_id', workspaceId)
+      .eq('agent_id', agentId)
+      .maybeSingle();
+
+    if (refreshErr) {
+      throw new Error(
+        `HTTP 500 [verify_document_row]: Failed to reload processed document: ${refreshErr.message}`
+      );
+    }
+
+    const confirmedStatus =
+      edgeData?.status ||
+      edgeData?.document?.status ||
+      refreshedDocRow?.status;
+    const confirmedChunkCount = Number(
+      edgeData?.chunk_count ??
+        edgeData?.chunkCount ??
+        edgeData?.chunks_created ??
+        edgeData?.document?.chunk_count ??
+        refreshedDocRow?.chunk_count ??
+        0
+    );
+    const edgeConfirmedSuccess =
+      edgeData?.success === true ||
+      edgeData?.ok === true ||
+      (confirmedStatus === 'ready' && confirmedChunkCount > 0);
+
+    // Only show Ready when the Edge Function returns success and confirms status 'ready' with a positive chunk count
+    if (
+      !edgeConfirmedSuccess ||
+      confirmedStatus !== 'ready' ||
+      !Number.isFinite(confirmedChunkCount) ||
+      confirmedChunkCount <= 0
+    ) {
+      const stage = edgeData?.stage ? ` [${edgeData.stage}]` : ' [process_document]';
+      const status = edgeData?.status_code || edgeData?.statusCode || 422;
+      const reason =
+        edgeData?.error ||
+        edgeData?.message ||
+        refreshedDocRow?.error_message ||
+        `Edge Function did not confirm status="ready" with a positive chunk count (status="${
+          confirmedStatus || 'unknown'
+        }", chunk_count=${confirmedChunkCount}).`;
+      throw new Error(
+        reason.startsWith('HTTP ') ? reason : `HTTP ${status}${stage}: ${reason}`
+      );
+    }
+
+    const finalDocRow = refreshedDocRow
+      ? {
+          ...refreshedDocRow,
+          status: 'ready',
+          chunk_count: confirmedChunkCount,
+          error_message: null,
+        }
+      : {
+          ...docRow,
+          status: 'ready',
+          chunk_count: confirmedChunkCount,
+          error_message: null,
+        };
+
+    const mappedReady = mapSupabaseKnowledgeDocToFrontend(finalDocRow);
+    if (onStatusChange) {
+      onStatusChange(mappedReady);
+    }
+    return mappedReady;
+  } catch (err: any) {
+    const errorMessage =
+      err?.message || 'Document chunking and embedding generation failed.';
+
+    // Sync the failed status and diagnostic error message so UI and DB reflect the actual failure
+    const { data: failedRow } = await supabase
+      .from('knowledge_documents')
+      .update({
+        status: 'failed',
+        chunk_count: 0,
+        error_message: errorMessage,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', documentId)
+      .eq('workspace_id', workspaceId)
+      .select('*')
+      .maybeSingle();
+
+    if (onStatusChange) {
+      if (failedRow) {
+        onStatusChange(mapSupabaseKnowledgeDocToFrontend(failedRow));
+      }
+    }
+
+    throw new Error(errorMessage);
+  } finally {
+    inFlightDocumentIds.delete(documentId);
+  }
+}
 
 export async function getSupabaseAgents(userId: string): Promise<Agent[]> {
   if (!supabase) return [];
 
-  const { data, error } = await supabase
+  const workspaceId = await getOrCreateUserWorkspace(userId);
+
+  const { data: agentRows, error } = await supabase
     .from('agents')
     .select('*')
-    .eq('user_id', userId)
+    .eq('workspace_id', workspaceId)
     .order('created_at', { ascending: false });
 
   if (error) {
@@ -318,14 +1103,44 @@ export async function getSupabaseAgents(userId: string): Promise<Agent[]> {
     throw error;
   }
 
-  return (data || []).map(mapSupabaseAgentToFrontend);
+  if (!agentRows || agentRows.length === 0) return [];
+
+  const { data: allDocs } = await supabase
+    .from('knowledge_documents')
+    .select('*')
+    .eq('workspace_id', workspaceId);
+
+  const docsByAgent = new Map<string, any[]>();
+  for (const doc of allDocs || []) {
+    const list = docsByAgent.get(doc.agent_id) || [];
+    list.push(doc);
+    docsByAgent.set(doc.agent_id, list);
+  }
+
+  return agentRows.map((row) =>
+    mapSupabaseAgentToFrontend(row, docsByAgent.get(row.id) || [], userId)
+  );
 }
 
 export async function createSupabaseAgent(agentData: Partial<Agent>, userId: string): Promise<Agent> {
   if (!supabase) throw new Error('Supabase client not configured');
 
-  const payload = mapFrontendAgentToSupabase(agentData, userId);
-  if (!payload.created_at) payload.created_at = new Date().toISOString();
+  const workspaceId = await getOrCreateUserWorkspace(userId);
+
+  const payload: Record<string, any> = {
+    workspace_id: workspaceId,
+    created_by: userId,
+    name: agentData.name || 'AI Concierge',
+    description: agentData.roleAndDuties || agentData.description || '',
+    greeting: agentData.openingLine || '',
+    tone: agentData.tone || 'friendly',
+    status: agentData.status || 'active',
+    always_on: agentData.availability?.is24x7 ?? true,
+    active_from: agentData.availability?.startHour || '08:00',
+    active_to: agentData.availability?.endHour || '20:00',
+    active_days: agentData.availability?.activeDays || [0, 1, 2, 3, 4, 5, 6],
+    timezone: agentData.availability?.timezone || 'America/New_York',
+  };
 
   const { data, error } = await supabase
     .from('agents')
@@ -334,13 +1149,38 @@ export async function createSupabaseAgent(agentData: Partial<Agent>, userId: str
     .single();
 
   if (error) throw error;
-  return mapSupabaseAgentToFrontend(data);
+
+  const docs = await syncAgentExtendedConfigAndDocs(workspaceId, data.id, agentData);
+  return mapSupabaseAgentToFrontend(data, docs, userId);
 }
 
-export async function updateSupabaseAgent(agentId: string, updates: Partial<Agent>, userId: string): Promise<Agent> {
+export async function updateSupabaseAgent(
+  agentId: string,
+  updates: Partial<Agent>,
+  userId: string
+): Promise<Agent> {
   if (!supabase) throw new Error('Supabase client not configured');
 
-  const payload = mapFrontendAgentToSupabase(updates, userId);
+  const workspaceId = await getOrCreateUserWorkspace(userId);
+
+  const payload: Record<string, any> = {
+    updated_at: new Date().toISOString(),
+  };
+
+  if (updates.name !== undefined) payload.name = updates.name;
+  if (updates.roleAndDuties !== undefined || updates.description !== undefined) {
+    payload.description = updates.roleAndDuties ?? updates.description ?? '';
+  }
+  if (updates.openingLine !== undefined) payload.greeting = updates.openingLine;
+  if (updates.tone !== undefined) payload.tone = updates.tone;
+  if (updates.status !== undefined) payload.status = updates.status;
+  if (updates.availability !== undefined) {
+    payload.always_on = updates.availability.is24x7 ?? true;
+    payload.active_from = updates.availability.startHour || '08:00';
+    payload.active_to = updates.availability.endHour || '20:00';
+    payload.active_days = updates.availability.activeDays || [0, 1, 2, 3, 4, 5, 6];
+    payload.timezone = updates.availability.timezone || 'America/New_York';
+  }
 
   const { data, error } = await supabase
     .from('agents')
@@ -350,17 +1190,18 @@ export async function updateSupabaseAgent(agentId: string, updates: Partial<Agen
     .single();
 
   if (error) throw error;
-  return mapSupabaseAgentToFrontend(data);
+
+  const docs = await syncAgentExtendedConfigAndDocs(workspaceId, agentId, updates);
+  return mapSupabaseAgentToFrontend(data, docs, userId);
 }
 
 export async function deleteSupabaseAgent(agentId: string): Promise<void> {
   if (!supabase) throw new Error('Supabase client not configured');
 
-  const { error } = await supabase
-    .from('agents')
-    .delete()
-    .eq('id', agentId);
+  await supabase.from('knowledge_documents').delete().eq('agent_id', agentId);
+  await supabase.from('channel_connections').update({ agent_id: null }).eq('agent_id', agentId);
 
+  const { error } = await supabase.from('agents').delete().eq('id', agentId);
   if (error) throw error;
 }
 
@@ -371,10 +1212,12 @@ export async function deleteSupabaseAgent(agentId: string): Promise<void> {
 export async function getSupabaseConnections(userId: string): Promise<ChannelConnection[]> {
   if (!supabase) return [];
 
+  const workspaceId = await getOrCreateUserWorkspace(userId);
+
   const { data, error } = await supabase
     .from('channel_connections')
     .select('*, agents(name)')
-    .eq('user_id', userId)
+    .eq('workspace_id', workspaceId)
     .order('created_at', { ascending: false });
 
   if (error) {
@@ -382,18 +1225,27 @@ export async function getSupabaseConnections(userId: string): Promise<ChannelCon
     throw error;
   }
 
-  return (data || []).map(mapSupabaseConnectionToFrontend);
+  return (data || []).map((row) => mapSupabaseConnectionToFrontend(row, userId));
 }
 
-export async function createSupabaseConnection(conn: Partial<ChannelConnection>, userId: string): Promise<ChannelConnection> {
+export async function createSupabaseConnection(
+  conn: Partial<ChannelConnection>,
+  userId: string
+): Promise<ChannelConnection> {
   if (!supabase) throw new Error('Supabase client not configured');
 
+  const workspaceId = await getOrCreateUserWorkspace(userId);
+
+  const isValidUuid = (val?: string | null) =>
+    Boolean(val && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val));
+
   const payload = {
-    user_id: userId,
-    agent_id: conn.agent_id || null,
+    workspace_id: workspaceId,
+    agent_id: isValidUuid(conn.agent_id) ? conn.agent_id : null,
     channel: conn.channel,
-    display_name: conn.display_name,
-    handle: conn.handle,
+    display_name: conn.display_name || `${conn.channel} Connection`,
+    business_name: conn.display_name || 'My Business',
+    handle: conn.handle || '',
     status: conn.status || 'connected',
     reply_dms: conn.reply_dms ?? true,
     reply_comments: conn.reply_comments ?? false,
@@ -405,7 +1257,6 @@ export async function createSupabaseConnection(conn: Partial<ChannelConnection>,
     active_to: conn.active_to || '20:00',
     active_days: conn.active_days || [1, 2, 3, 4, 5, 6, 7],
     timezone: conn.timezone || 'America/New_York',
-    created_at: new Date().toISOString(),
   };
 
   const { data, error } = await supabase
@@ -415,15 +1266,38 @@ export async function createSupabaseConnection(conn: Partial<ChannelConnection>,
     .single();
 
   if (error) throw error;
-  return mapSupabaseConnectionToFrontend(data);
+  return mapSupabaseConnectionToFrontend(data, userId);
 }
 
-export async function updateSupabaseConnection(connId: string, updates: Partial<ChannelConnection>): Promise<ChannelConnection> {
+export async function updateSupabaseConnection(
+  connId: string,
+  updates: Partial<ChannelConnection>
+): Promise<ChannelConnection> {
   if (!supabase) throw new Error('Supabase client not configured');
 
-  const payload: Record<string, any> = { ...updates };
-  delete payload.agents;
-  delete payload.id;
+  const isValidUuid = (val?: string | null) =>
+    Boolean(val && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val));
+
+  const payload: Record<string, any> = {
+    updated_at: new Date().toISOString(),
+  };
+
+  if (updates.agent_id !== undefined) {
+    payload.agent_id = isValidUuid(updates.agent_id) ? updates.agent_id : null;
+  }
+  if (updates.display_name !== undefined) payload.display_name = updates.display_name;
+  if (updates.handle !== undefined) payload.handle = updates.handle;
+  if (updates.status !== undefined) payload.status = updates.status;
+  if (updates.reply_dms !== undefined) payload.reply_dms = updates.reply_dms;
+  if (updates.reply_comments !== undefined) payload.reply_comments = updates.reply_comments;
+  if (updates.reply_tags !== undefined) payload.reply_tags = updates.reply_tags;
+  if (updates.comment_keywords !== undefined) payload.comment_keywords = updates.comment_keywords;
+  if (updates.tag_accounts !== undefined) payload.tag_accounts = updates.tag_accounts;
+  if (updates.always_on !== undefined) payload.always_on = updates.always_on;
+  if (updates.active_from !== undefined) payload.active_from = updates.active_from;
+  if (updates.active_to !== undefined) payload.active_to = updates.active_to;
+  if (updates.active_days !== undefined) payload.active_days = updates.active_days;
+  if (updates.timezone !== undefined) payload.timezone = updates.timezone;
 
   const { data, error } = await supabase
     .from('channel_connections')
@@ -439,12 +1313,1407 @@ export async function updateSupabaseConnection(connId: string, updates: Partial<
 export async function deleteSupabaseConnection(connId: string): Promise<void> {
   if (!supabase) throw new Error('Supabase client not configured');
 
-  const { error } = await supabase
-    .from('channel_connections')
-    .delete()
-    .eq('id', connId);
-
+  const { error } = await supabase.from('channel_connections').delete().eq('id', connId);
   if (error) throw error;
+}
+
+export function isValidUuid(val?: string | null): boolean {
+  if (!val || typeof val !== 'string') return false;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+    val.trim()
+  );
+}
+
+// Guard to prevent duplicate concurrent feedback submissions for the same target
+const inFlightFeedbackKeys = new Set<string>();
+
+export interface ConversationFeedbackRecord {
+  id: string;
+  workspace_id: string;
+  agent_id: string | null;
+  conversation_id: string | null;
+  submitted_by: string;
+  rating: number;
+  comment: string | null;
+  created_at: string;
+  message_id: string | null;
+  tags: string[];
+}
+
+export interface SaveConversationFeedbackParams {
+  workspaceId?: string | null;
+  agentId?: string | null;
+  conversationId?: string | null;
+  messageId?: string | null;
+  feedbackId?: string | null;
+  rating: number;
+  comment?: string | null;
+  tags?: string[];
+}
+
+/**
+ * Reusable service to persist agent response feedback into `public.conversation_feedback`.
+ * 1. Retrieves and verifies the current authenticated user (`getVerifiedSupabaseAccessToken`).
+ * 2. Validates `rating` as an integer between 1 and 5 and `tags` as an array of strings.
+ * 3. Validates that `workspace_id`, `agent_id`, `conversation_id`, and `message_id` belong to the same workspace and are related:
+ *    - Authenticated user is an owner or member of `workspace_id`.
+ *    - `agent_id` is required for all new feedback records and `agents.workspace_id = workspace_id`.
+ *    - If `conversation_id` is provided, `conversations.workspace_id = workspace_id` and `conversations.agent_id = agent_id`.
+ *    - If `message_id` is provided, `messages.workspace_id = workspace_id` and `messages.conversation_id = conversation_id`.
+ * 4. Ensures synthetic IDs (e.g. `initial-greeting`, `agent-...`, `msg_...`, `conv_...`) are NEVER passed into UUID columns.
+ * 5. Respects `conversation_feedback_message_user_unique` and `conversation_feedback_conversation_user_unique` by updating existing records when re-rating.
+ * 6. Returns the saved database record and throws actual Supabase errors on failure.
+ */
+export async function saveSupabaseConversationFeedback(
+  params: SaveConversationFeedbackParams
+): Promise<ConversationFeedbackRecord> {
+  if (!supabase) {
+    throw new Error('Supabase client is not configured.');
+  }
+
+  // 1. Validate rating as an integer between 1 and 5
+  const numericRating = Number(params.rating);
+  if (
+    !Number.isInteger(numericRating) ||
+    numericRating < 1 ||
+    numericRating > 5
+  ) {
+    throw new Error('Rating must be an integer between 1 and 5.');
+  }
+
+  // 2. Validate tags as an array of strings
+  if (
+    params.tags !== undefined &&
+    (!Array.isArray(params.tags) ||
+      !params.tags.every((t) => typeof t === 'string'))
+  ) {
+    throw new Error('Tags must be an array of strings.');
+  }
+
+  // 3. Verify active authenticated user session (never accept submitted_by from frontend parameters)
+  const { userId } = await getVerifiedSupabaseAccessToken();
+
+  // 4. Sanitize UUID references (never pass synthetic IDs like initial-greeting, agent-123, or msg_123)
+  let resolvedWorkspaceId: string | null = isValidUuid(params.workspaceId)
+    ? params.workspaceId!.trim()
+    : null;
+  let resolvedAgentId: string | null = isValidUuid(params.agentId)
+    ? params.agentId!.trim()
+    : null;
+  let validConversationId: string | null = isValidUuid(params.conversationId)
+    ? params.conversationId!.trim()
+    : null;
+  let validMessageId: string | null = isValidUuid(params.messageId)
+    ? params.messageId!.trim()
+    : null;
+  const validFeedbackId: string | null = isValidUuid(params.feedbackId)
+    ? params.feedbackId!.trim()
+    : null;
+
+  // 5. If conversation_id is provided, verify it exists and inspect its workspace_id and agent_id
+  if (validConversationId) {
+    const { data: convRow, error: convLookupErr } = await supabase
+      .from('conversations')
+      .select('id, workspace_id, agent_id')
+      .eq('id', validConversationId)
+      .maybeSingle();
+
+    if (convLookupErr) {
+      throw new Error(
+        `Failed to verify conversation record: ${convLookupErr.message}`
+      );
+    }
+
+    if (!convRow) {
+      // Unpersisted conversation ID; do not send an unverified UUID to conversation_id
+      validConversationId = null;
+    } else {
+      if (
+        resolvedWorkspaceId &&
+        convRow.workspace_id &&
+        convRow.workspace_id !== resolvedWorkspaceId
+      ) {
+        throw new Error(
+          'Conversation does not belong to the specified workspace.'
+        );
+      }
+      if (!resolvedWorkspaceId && isValidUuid(convRow.workspace_id)) {
+        resolvedWorkspaceId = convRow.workspace_id;
+      }
+
+      if (
+        resolvedAgentId &&
+        isValidUuid(convRow.agent_id) &&
+        convRow.agent_id !== resolvedAgentId
+      ) {
+        throw new Error('Conversation does not belong to the specified agent.');
+      }
+      if (!resolvedAgentId && isValidUuid(convRow.agent_id)) {
+        resolvedAgentId = convRow.agent_id;
+      }
+    }
+  }
+
+  // 6. If message_id is provided, verify it exists and check its conversation_id and workspace_id
+  if (validMessageId) {
+    const { data: msgRow, error: msgLookupErr } = await supabase
+      .from('messages')
+      .select('id, conversation_id, workspace_id')
+      .eq('id', validMessageId)
+      .maybeSingle();
+
+    if (msgLookupErr) {
+      throw new Error(
+        `Failed to verify message record: ${msgLookupErr.message}`
+      );
+    }
+
+    if (!msgRow) {
+      // Message UUID is not persisted in public.messages; keep message_id null
+      validMessageId = null;
+    } else {
+      if (
+        resolvedWorkspaceId &&
+        msgRow.workspace_id &&
+        msgRow.workspace_id !== resolvedWorkspaceId
+      ) {
+        throw new Error('Message does not belong to the specified workspace.');
+      }
+      if (!resolvedWorkspaceId && isValidUuid(msgRow.workspace_id)) {
+        resolvedWorkspaceId = msgRow.workspace_id;
+      }
+
+      if (
+        validConversationId &&
+        msgRow.conversation_id &&
+        msgRow.conversation_id !== validConversationId
+      ) {
+        throw new Error(
+          'Message does not belong to the specified conversation.'
+        );
+      }
+
+      if (!validConversationId && isValidUuid(msgRow.conversation_id)) {
+        const { data: msgConvRow, error: msgConvErr } = await supabase
+          .from('conversations')
+          .select('id, workspace_id, agent_id')
+          .eq('id', msgRow.conversation_id)
+          .maybeSingle();
+
+        if (msgConvErr) {
+          throw new Error(
+            `Failed to verify message conversation: ${msgConvErr.message}`
+          );
+        }
+
+        if (msgConvRow) {
+          validConversationId = msgConvRow.id;
+          if (!resolvedWorkspaceId && isValidUuid(msgConvRow.workspace_id)) {
+            resolvedWorkspaceId = msgConvRow.workspace_id;
+          }
+          if (
+            resolvedAgentId &&
+            isValidUuid(msgConvRow.agent_id) &&
+            msgConvRow.agent_id !== resolvedAgentId
+          ) {
+            throw new Error(
+              'Message conversation does not belong to the specified agent.'
+            );
+          }
+          if (!resolvedAgentId && isValidUuid(msgConvRow.agent_id)) {
+            resolvedAgentId = msgConvRow.agent_id;
+          }
+        }
+      }
+    }
+  }
+
+  // 7. Require a valid agent_id for all new feedback records and verify agents.workspace_id = workspace_id
+  if (!isValidUuid(resolvedAgentId)) {
+    throw new Error(
+      'A valid agent_id is required to submit feedback. Please select or save a valid agent first.'
+    );
+  }
+
+  const { data: agentRow, error: agentLookupErr } = await supabase
+    .from('agents')
+    .select('id, workspace_id')
+    .eq('id', resolvedAgentId!)
+    .maybeSingle();
+
+  if (agentLookupErr) {
+    throw new Error(
+      `Failed to verify agent record: ${agentLookupErr.message}`
+    );
+  }
+
+  if (!agentRow || !isValidUuid(agentRow.workspace_id)) {
+    throw new Error(
+      'Selected agent does not exist in Supabase. Please save the agent before submitting feedback.'
+    );
+  }
+
+  if (resolvedWorkspaceId && agentRow.workspace_id !== resolvedWorkspaceId) {
+    throw new Error('Agent does not belong to the specified workspace.');
+  }
+
+  resolvedWorkspaceId = agentRow.workspace_id;
+
+  if (!isValidUuid(resolvedWorkspaceId)) {
+    throw new Error(
+      'Could not resolve a valid workspace_id for the authenticated user.'
+    );
+  }
+
+  // 8. Verify that the authenticated user is a member or owner of workspace_id
+  const [
+    { data: wsOwnerRow, error: wsOwnerErr },
+    { data: wsMemberRow, error: wsMemberErr },
+  ] = await Promise.all([
+    supabase
+      .from('workspaces')
+      .select('id, owner_user_id')
+      .eq('id', resolvedWorkspaceId)
+      .maybeSingle(),
+    supabase
+      .from('workspace_members')
+      .select('workspace_id, user_id')
+      .eq('workspace_id', resolvedWorkspaceId)
+      .eq('user_id', userId)
+      .maybeSingle(),
+  ]);
+
+  if (wsOwnerErr && wsMemberErr) {
+    throw new Error(
+      `Failed to verify workspace ownership: ${wsOwnerErr.message}`
+    );
+  }
+
+  const isWorkspaceOwner = wsOwnerRow?.owner_user_id === userId;
+  const isWorkspaceMember = Boolean(wsMemberRow?.workspace_id);
+
+  if (!isWorkspaceOwner && !isWorkspaceMember) {
+    throw new Error(
+      'Authenticated user is not a member or owner of this workspace.'
+    );
+  }
+
+  // 9. Final cross-check on conversation_id and message_id relationships against resolvedWorkspaceId and resolvedAgentId
+  if (validConversationId) {
+    const { data: convVerify, error: convVerifyErr } = await supabase
+      .from('conversations')
+      .select('id, workspace_id, agent_id')
+      .eq('id', validConversationId)
+      .eq('workspace_id', resolvedWorkspaceId)
+      .maybeSingle();
+
+    if (convVerifyErr) {
+      throw new Error(
+        `Failed to verify conversation relationship: ${convVerifyErr.message}`
+      );
+    }
+
+    if (!convVerify) {
+      throw new Error(
+        'Conversation does not exist in the verified workspace.'
+      );
+    }
+
+    if (
+      isValidUuid(convVerify.agent_id) &&
+      convVerify.agent_id !== resolvedAgentId
+    ) {
+      throw new Error(
+        'Conversation agent_id does not match the feedback agent_id.'
+      );
+    }
+  }
+
+  if (validMessageId) {
+    const { data: msgVerify, error: msgVerifyErr } = await supabase
+      .from('messages')
+      .select('id, workspace_id, conversation_id')
+      .eq('id', validMessageId)
+      .eq('workspace_id', resolvedWorkspaceId)
+      .maybeSingle();
+
+    if (msgVerifyErr) {
+      throw new Error(
+        `Failed to verify message relationship: ${msgVerifyErr.message}`
+      );
+    }
+
+    if (!msgVerify) {
+      throw new Error('Message does not exist in the verified workspace.');
+    }
+
+    if (
+      validConversationId &&
+      msgVerify.conversation_id !== validConversationId
+    ) {
+      throw new Error(
+        'Message conversation_id does not match the specified conversation_id.'
+      );
+    }
+  }
+
+  // 10. Normalize comment and tags separately (never concatenate tags into comment)
+  const normalizedTags: string[] = Array.isArray(params.tags)
+    ? Array.from(
+        new Set(
+          params.tags
+            .map((t) => (typeof t === 'string' ? t.trim() : ''))
+            .filter(Boolean)
+        )
+      )
+    : [];
+
+  const trimmedComment =
+    typeof params.comment === 'string' ? params.comment.trim() : '';
+  const normalizedComment: string | null =
+    trimmedComment.length > 0 ? trimmedComment : null;
+
+  const inFlightKey = `${resolvedWorkspaceId}:${resolvedAgentId}:${
+    validConversationId || 'null'
+  }:${validMessageId || validFeedbackId || 'null'}:${userId}`;
+
+  if (inFlightFeedbackKeys.has(inFlightKey)) {
+    throw new Error('Feedback submission is already in progress. Please wait.');
+  }
+
+  inFlightFeedbackKeys.add(inFlightKey);
+
+  const feedbackSelectColumns =
+    'id, workspace_id, agent_id, conversation_id, submitted_by, rating, comment, created_at, message_id, tags';
+
+  const mapFeedbackRow = (row: any): ConversationFeedbackRecord => ({
+    id: row.id,
+    workspace_id: row.workspace_id,
+    agent_id: row.agent_id ?? null,
+    conversation_id: row.conversation_id ?? null,
+    submitted_by: row.submitted_by,
+    rating: Number(row.rating),
+    comment: row.comment ?? null,
+    created_at: row.created_at,
+    message_id: row.message_id ?? null,
+    tags: Array.isArray(row.tags) ? row.tags : [],
+  });
+
+  try {
+    // 11. Check if an existing feedback row should be updated in place to respect:
+    //     - explicit feedbackId (e.g. re-rating a simulator message in the same session)
+    //     - conversation_feedback_message_user_unique: (message_id, submitted_by) WHERE message_id IS NOT NULL
+    //     - conversation_feedback_conversation_user_unique: (conversation_id, submitted_by) WHERE message_id IS NULL AND conversation_id IS NOT NULL
+    let existingFeedbackId: string | null = null;
+
+    if (validFeedbackId) {
+      const { data: byIdRow } = await supabase
+        .from('conversation_feedback')
+        .select('id')
+        .eq('id', validFeedbackId)
+        .eq('workspace_id', resolvedWorkspaceId)
+        .eq('submitted_by', userId)
+        .maybeSingle();
+
+      if (byIdRow?.id) {
+        existingFeedbackId = byIdRow.id;
+      }
+    }
+
+    if (!existingFeedbackId && validMessageId) {
+      const { data: byMsgRow } = await supabase
+        .from('conversation_feedback')
+        .select('id')
+        .eq('message_id', validMessageId)
+        .eq('submitted_by', userId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (byMsgRow?.id) {
+        existingFeedbackId = byMsgRow.id;
+      }
+    }
+
+    if (!existingFeedbackId && validConversationId && !validMessageId) {
+      const { data: byConvRow } = await supabase
+        .from('conversation_feedback')
+        .select('id')
+        .eq('conversation_id', validConversationId)
+        .is('message_id', null)
+        .eq('submitted_by', userId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (byConvRow?.id) {
+        existingFeedbackId = byConvRow.id;
+      }
+    }
+
+    if (existingFeedbackId) {
+      const { data: updatedRow, error: updateErr } = await supabase
+        .from('conversation_feedback')
+        .update({
+          agent_id: resolvedAgentId,
+          rating: numericRating,
+          comment: normalizedComment,
+          tags: normalizedTags,
+        })
+        .eq('id', existingFeedbackId)
+        .eq('workspace_id', resolvedWorkspaceId)
+        .eq('submitted_by', userId)
+        .select(feedbackSelectColumns)
+        .maybeSingle();
+
+      if (updateErr) {
+        throw new Error(
+          `${updateErr.message}${
+            updateErr.details ? ` (${updateErr.details})` : ''
+          }`
+        );
+      }
+
+      if (updatedRow) {
+        return mapFeedbackRow(updatedRow);
+      }
+    }
+
+    // 12. Insert new feedback record into public.conversation_feedback using the exact database columns
+    const insertPayload = {
+      workspace_id: resolvedWorkspaceId,
+      agent_id: resolvedAgentId,
+      conversation_id: validConversationId,
+      submitted_by: userId,
+      rating: numericRating,
+      comment: normalizedComment,
+      message_id: validMessageId,
+      tags: normalizedTags,
+    };
+
+    const { data: insertedRow, error: insertErr } = await supabase
+      .from('conversation_feedback')
+      .insert(insertPayload)
+      .select(feedbackSelectColumns)
+      .single();
+
+    if (insertErr) {
+      // Handle race condition against unique indexes by updating the conflicting row
+      if (
+        insertErr.code === '23505' &&
+        (validMessageId || validConversationId)
+      ) {
+        let conflictQuery = supabase
+          .from('conversation_feedback')
+          .update({
+            agent_id: resolvedAgentId,
+            rating: numericRating,
+            comment: normalizedComment,
+            tags: normalizedTags,
+          })
+          .eq('workspace_id', resolvedWorkspaceId)
+          .eq('submitted_by', userId);
+
+        if (validMessageId) {
+          conflictQuery = conflictQuery.eq('message_id', validMessageId);
+        } else if (validConversationId) {
+          conflictQuery = conflictQuery
+            .eq('conversation_id', validConversationId)
+            .is('message_id', null);
+        }
+
+        const { data: recoveredRow, error: recoverErr } = await conflictQuery
+          .select(feedbackSelectColumns)
+          .maybeSingle();
+
+        if (!recoverErr && recoveredRow) {
+          return mapFeedbackRow(recoveredRow);
+        }
+      }
+
+      throw new Error(
+        `${insertErr.message}${
+          insertErr.details ? ` (${insertErr.details})` : ''
+        }`
+      );
+    }
+
+    if (!insertedRow) {
+      throw new Error('Failed to insert feedback into conversation_feedback.');
+    }
+
+    return mapFeedbackRow(insertedRow);
+  } finally {
+    inFlightFeedbackKeys.delete(inFlightKey);
+  }
+}
+
+/**
+ * Reusable retrieval function that loads saved feedback from `public.conversation_feedback`
+ * for a workspace, and optionally filters by agent_id, conversation_id, or message_id.
+ * Filtering by `agentId` strictly matches `agent_id = <uuid>` so historical rows with NULL `agent_id`
+ * are never misattributed to any agent.
+ */
+export async function getSupabaseConversationFeedback(params?: {
+  workspaceId?: string | null;
+  agentId?: string | null;
+  conversationId?: string | null;
+  messageId?: string | null;
+  limit?: number;
+}): Promise<ConversationFeedbackRecord[]> {
+  if (!supabase) return [];
+
+  const { userId } = await getVerifiedSupabaseAccessToken();
+
+  let resolvedWorkspaceId: string | null = isValidUuid(params?.workspaceId)
+    ? params!.workspaceId!.trim()
+    : null;
+
+  if (!resolvedWorkspaceId && isValidUuid(params?.agentId)) {
+    const { data: agentRow } = await supabase
+      .from('agents')
+      .select('workspace_id')
+      .eq('id', params!.agentId!.trim())
+      .maybeSingle();
+    if (agentRow?.workspace_id) {
+      resolvedWorkspaceId = agentRow.workspace_id;
+    }
+  }
+
+  if (!resolvedWorkspaceId) {
+    resolvedWorkspaceId = await getOrCreateUserWorkspace(userId);
+  }
+
+  if (!isValidUuid(resolvedWorkspaceId)) {
+    return [];
+  }
+
+  let query = supabase
+    .from('conversation_feedback')
+    .select(
+      'id, workspace_id, agent_id, conversation_id, submitted_by, rating, comment, created_at, message_id, tags'
+    )
+    .eq('workspace_id', resolvedWorkspaceId)
+    .order('created_at', { ascending: false });
+
+  if (params?.agentId !== undefined) {
+    if (params.agentId === null) {
+      query = query.is('agent_id', null);
+    } else if (isValidUuid(params.agentId)) {
+      query = query.eq('agent_id', params.agentId.trim());
+    } else {
+      return [];
+    }
+  }
+
+  if (params?.conversationId !== undefined) {
+    if (params.conversationId === null) {
+      query = query.is('conversation_id', null);
+    } else if (isValidUuid(params.conversationId)) {
+      query = query.eq('conversation_id', params.conversationId.trim());
+    } else {
+      return [];
+    }
+  }
+
+  if (params?.messageId !== undefined) {
+    if (params.messageId === null) {
+      query = query.is('message_id', null);
+    } else if (isValidUuid(params.messageId)) {
+      query = query.eq('message_id', params.messageId.trim());
+    } else {
+      return [];
+    }
+  }
+
+  if (params?.limit && params.limit > 0) {
+    query = query.limit(params.limit);
+  }
+
+  const { data, error } = await query;
+
+  if (error) {
+    throw new Error(
+      `Failed to load conversation feedback: ${error.message}`
+    );
+  }
+
+  return (data || []).map((row: any) => ({
+    id: row.id,
+    workspace_id: row.workspace_id,
+    agent_id: row.agent_id ?? null,
+    conversation_id: row.conversation_id ?? null,
+    submitted_by: row.submitted_by,
+    rating: Number(row.rating),
+    comment: row.comment ?? null,
+    created_at: row.created_at,
+    message_id: row.message_id ?? null,
+    tags: Array.isArray(row.tags) ? row.tags : [],
+  }));
+}
+
+export const TEST_CONVERSATION_HANDLE = '__agent_test_simulator__';
+
+/**
+ * Determines whether a `public.conversations` row is an internal Agent Test conversation
+ * rather than a real customer Inbox conversation.
+ */
+export function isTestConversationRow(row: any): boolean {
+  if (!row) return false;
+  // Real channel conversations always have a non-null connection_id;
+  // Agent Test Simulator conversations always have connection_id = null.
+  if (row.connection_id !== null && row.connection_id !== undefined) {
+    return false;
+  }
+  if (
+    typeof row.customer_handle === 'string' &&
+    row.customer_handle.trim() === TEST_CONVERSATION_HANDLE
+  ) {
+    return true;
+  }
+  const meta = row.metadata || {};
+  return (
+    meta.is_test === true ||
+    meta.conversation_type === 'agent_test' ||
+    meta.source === 'agent_simulator' ||
+    meta.platform === 'simulator'
+  );
+}
+
+export interface AgentTestMessageRecord {
+  id: string;
+  workspace_id: string;
+  conversation_id: string;
+  sender_type: 'customer' | 'agent';
+  direction: 'inbound' | 'outbound';
+  content: string;
+  created_at: string;
+  client_message_id?: string;
+  sequence?: number;
+  rating?: number;
+  feedback?: string;
+  feedbackTags?: string[];
+  feedbackId?: string;
+  feedbackCreatedAt?: string;
+}
+
+export interface AgentTestConversation {
+  id: string;
+  workspace_id: string;
+  agent_id: string;
+  connection_id: null;
+  title: string;
+  created_at: string;
+  last_message_at: string;
+  last_message_text: string;
+  message_count: number;
+  messages: AgentTestMessageRecord[];
+}
+
+/**
+ * Internal helper that verifies:
+ * 1. The user has an active authenticated Supabase session (`getVerifiedSupabaseAccessToken`).
+ * 2. `agentId` is a valid UUID and exists in `public.agents`.
+ * 3. `workspaceId` matches `agents.workspace_id`.
+ * 4. The authenticated user is an owner (`workspaces.owner_user_id`) or member (`workspace_members`) of `workspaceId`.
+ */
+async function verifyAgentAndWorkspaceAccess(params: {
+  workspaceId?: string | null;
+  agentId: string;
+}): Promise<{
+  userId: string;
+  accessToken: string;
+  workspaceId: string;
+  agentId: string;
+  agentName: string;
+}> {
+  if (!supabase) {
+    throw new Error('Supabase client is not configured.');
+  }
+
+  const { userId, accessToken } = await getVerifiedSupabaseAccessToken();
+
+  if (!isValidUuid(params.agentId)) {
+    throw new Error(
+      'A valid saved agent ID is required for test conversations.'
+    );
+  }
+
+  const normalizedAgentId = params.agentId.trim();
+
+  const { data: agentRow, error: agentErr } = await supabase
+    .from('agents')
+    .select('id, workspace_id, name')
+    .eq('id', normalizedAgentId)
+    .maybeSingle();
+
+  if (agentErr) {
+    throw new Error(`Failed to verify agent: ${agentErr.message}`);
+  }
+
+  if (!agentRow || !isValidUuid(agentRow.workspace_id)) {
+    throw new Error(
+      'Agent does not exist in Supabase. Please save the agent first.'
+    );
+  }
+
+  if (
+    isValidUuid(params.workspaceId) &&
+    params.workspaceId!.trim() !== agentRow.workspace_id
+  ) {
+    throw new Error('Agent does not belong to the specified workspace.');
+  }
+
+  const resolvedWorkspaceId = agentRow.workspace_id;
+
+  const [
+    { data: wsOwnerRow, error: wsOwnerErr },
+    { data: wsMemberRow, error: wsMemberErr },
+  ] = await Promise.all([
+    supabase
+      .from('workspaces')
+      .select('id, owner_user_id')
+      .eq('id', resolvedWorkspaceId)
+      .maybeSingle(),
+    supabase
+      .from('workspace_members')
+      .select('workspace_id, user_id')
+      .eq('workspace_id', resolvedWorkspaceId)
+      .eq('user_id', userId)
+      .maybeSingle(),
+  ]);
+
+  if (wsOwnerErr && wsMemberErr) {
+    throw new Error(
+      `Failed to verify workspace access: ${wsOwnerErr.message}`
+    );
+  }
+
+  const isOwner = wsOwnerRow?.owner_user_id === userId;
+  const isMember = Boolean(wsMemberRow?.workspace_id);
+
+  if (!isOwner && !isMember) {
+    throw new Error(
+      'Authenticated user does not have access to this workspace.'
+    );
+  }
+
+  return {
+    userId,
+    accessToken,
+    workspaceId: resolvedWorkspaceId,
+    agentId: agentRow.id,
+    agentName: agentRow.name || 'AI Agent',
+  };
+}
+
+/**
+ * Sorts raw `public.messages` rows in strict chronological order (`created_at` ascending),
+ * using `metadata.sequence` and sender direction (`customer` before `agent` on identical timestamps)
+ * as deterministic tie-breakers so restored messages always appear in exact conversation order.
+ */
+function sortAndMapTestMessages(
+  rawMessages: any[],
+  feedbackByMessageId: Map<string, any>
+): AgentTestMessageRecord[] {
+  return [...(rawMessages || [])]
+    .sort((a: any, b: any) => {
+      const timeA = new Date(a.created_at || 0).getTime();
+      const timeB = new Date(b.created_at || 0).getTime();
+      if (timeA !== timeB) {
+        return timeA - timeB;
+      }
+
+      const seqA =
+        typeof a.metadata?.sequence === 'number'
+          ? a.metadata.sequence
+          : undefined;
+      const seqB =
+        typeof b.metadata?.sequence === 'number'
+          ? b.metadata.sequence
+          : undefined;
+      if (seqA !== undefined && seqB !== undefined && seqA !== seqB) {
+        return seqA - seqB;
+      }
+
+      if (a.sender_type !== b.sender_type) {
+        if (a.sender_type === 'customer') return -1;
+        if (b.sender_type === 'customer') return 1;
+      }
+
+      return String(a.id || '').localeCompare(String(b.id || ''));
+    })
+    .map((m: any) => {
+      const msgMeta = m.metadata || {};
+      const msgFeedback = feedbackByMessageId.get(m.id);
+      const senderType: 'customer' | 'agent' =
+        m.sender_type === 'customer' ? 'customer' : 'agent';
+
+      return {
+        id: m.id,
+        workspace_id: m.workspace_id,
+        conversation_id: m.conversation_id,
+        sender_type: senderType,
+        direction:
+          m.direction || (senderType === 'customer' ? 'inbound' : 'outbound'),
+        content: m.content || '',
+        created_at: m.created_at || new Date().toISOString(),
+        client_message_id:
+          typeof msgMeta.client_message_id === 'string'
+            ? msgMeta.client_message_id
+            : undefined,
+        sequence:
+          typeof msgMeta.sequence === 'number' ? msgMeta.sequence : undefined,
+        rating: msgFeedback
+          ? Number(msgFeedback.rating)
+          : typeof msgMeta.rating === 'number'
+          ? msgMeta.rating
+          : undefined,
+        feedback: msgFeedback ? msgFeedback.comment ?? '' : msgMeta.feedback,
+        feedbackTags:
+          msgFeedback && Array.isArray(msgFeedback.tags)
+            ? msgFeedback.tags
+            : Array.isArray(msgMeta.feedbackTags)
+            ? msgMeta.feedbackTags
+            : [],
+        feedbackId: msgFeedback ? msgFeedback.id : undefined,
+        feedbackCreatedAt: msgFeedback
+          ? msgFeedback.created_at
+          : msgMeta.feedbackCreatedAt,
+      };
+    });
+}
+
+function deriveTestConversationTitle(
+  convRow: any,
+  sortedMessages: AgentTestMessageRecord[]
+): string {
+  const firstCustomerMsg = sortedMessages.find(
+    (m) => m.sender_type === 'customer' && m.content.trim().length > 0
+  );
+  if (firstCustomerMsg) {
+    const clean = firstCustomerMsg.content.trim();
+    return clean.length > 56 ? `${clean.slice(0, 56)}…` : clean;
+  }
+
+  const metaTitle =
+    typeof convRow?.metadata?.title === 'string'
+      ? convRow.metadata.title.trim()
+      : '';
+  if (
+    metaTitle &&
+    metaTitle !== 'New Test Conversation' &&
+    metaTitle !== 'Agent Test Session'
+  ) {
+    return metaTitle;
+  }
+
+  const custName =
+    typeof convRow?.customer_name === 'string'
+      ? convRow.customer_name.trim()
+      : '';
+  if (
+    custName &&
+    custName !== 'New Test Conversation' &&
+    custName !== 'Agent Test Session' &&
+    custName !== 'New Customer'
+  ) {
+    return custName.replace(/^Test:\s*/i, '');
+  }
+
+  return 'New Test Conversation';
+}
+
+/**
+ * Retrieves all saved Agent Test conversations and their ordered messages from Supabase
+ * for a specific verified workspace and agent.
+ * Never mixes conversations from other agents, other workspaces, or real customer Inbox threads.
+ */
+export async function getSupabaseTestConversations(params: {
+  workspaceId?: string | null;
+  agentId: string;
+}): Promise<AgentTestConversation[]> {
+  if (!supabase) return [];
+
+  const { workspaceId, agentId } = await verifyAgentAndWorkspaceAccess(params);
+
+  const { data: convRows, error: convErr } = await supabase
+    .from('conversations')
+    .select('*')
+    .eq('workspace_id', workspaceId)
+    .eq('agent_id', agentId)
+    .order('last_message_at', { ascending: false })
+    .order('created_at', { ascending: false });
+
+  if (convErr) {
+    throw new Error(
+      `Failed to load saved test conversations: ${convErr.message}`
+    );
+  }
+
+  const testConvRows = (convRows || []).filter(
+    (row: any) =>
+      row.workspace_id === workspaceId &&
+      row.agent_id === agentId &&
+      (row.connection_id === null || row.connection_id === undefined) &&
+      isTestConversationRow(row)
+  );
+
+  if (testConvRows.length === 0) {
+    return [];
+  }
+
+  const testConvIds = testConvRows.map((r: any) => r.id);
+
+  const [{ data: msgRows, error: msgErr }, { data: feedbackRows }] =
+    await Promise.all([
+      supabase
+        .from('messages')
+        .select('*')
+        .eq('workspace_id', workspaceId)
+        .in('conversation_id', testConvIds)
+        .order('created_at', { ascending: true }),
+      supabase
+        .from('conversation_feedback')
+        .select(
+          'id, workspace_id, agent_id, conversation_id, submitted_by, rating, comment, created_at, message_id, tags'
+        )
+        .eq('workspace_id', workspaceId)
+        .eq('agent_id', agentId)
+        .in('conversation_id', testConvIds)
+        .order('created_at', { ascending: true }),
+    ]);
+
+  if (msgErr) {
+    throw new Error(`Failed to load test messages: ${msgErr.message}`);
+  }
+
+  const feedbackByMessageId = new Map<string, any>();
+  for (const fb of feedbackRows || []) {
+    if (fb.message_id) {
+      feedbackByMessageId.set(fb.message_id, fb);
+    }
+  }
+
+  const messagesByConvId = new Map<string, any[]>();
+  for (const m of msgRows || []) {
+    if (m.workspace_id !== workspaceId) continue;
+    const list = messagesByConvId.get(m.conversation_id) || [];
+    list.push(m);
+    messagesByConvId.set(m.conversation_id, list);
+  }
+
+  return testConvRows.map((row: any) => {
+    const rawMsgs = messagesByConvId.get(row.id) || [];
+    const sortedMessages = sortAndMapTestMessages(rawMsgs, feedbackByMessageId);
+    const latestMsg = sortedMessages[sortedMessages.length - 1];
+    const title = deriveTestConversationTitle(row, sortedMessages);
+
+    return {
+      id: row.id,
+      workspace_id: row.workspace_id,
+      agent_id: row.agent_id,
+      connection_id: null,
+      title,
+      created_at: row.created_at || new Date().toISOString(),
+      last_message_at:
+        latestMsg?.created_at ||
+        row.last_message_at ||
+        row.created_at ||
+        new Date().toISOString(),
+      last_message_text: latestMsg?.content || '',
+      message_count: sortedMessages.length,
+      messages: sortedMessages,
+    };
+  });
+}
+
+/**
+ * Loads the ordered messages for a single saved Agent Test conversation after verifying
+ * that the conversation belongs to the specified workspace and agent and is a test conversation.
+ */
+export async function getSupabaseTestConversationMessages(params: {
+  workspaceId?: string | null;
+  agentId: string;
+  conversationId: string;
+}): Promise<AgentTestMessageRecord[]> {
+  if (!supabase) return [];
+
+  if (!isValidUuid(params.conversationId)) {
+    throw new Error('Invalid test conversation ID.');
+  }
+
+  const { workspaceId, agentId } = await verifyAgentAndWorkspaceAccess({
+    workspaceId: params.workspaceId,
+    agentId: params.agentId,
+  });
+
+  const conversationId = params.conversationId.trim();
+
+  const { data: convRow, error: convErr } = await supabase
+    .from('conversations')
+    .select('*')
+    .eq('id', conversationId)
+    .eq('workspace_id', workspaceId)
+    .eq('agent_id', agentId)
+    .maybeSingle();
+
+  if (convErr) {
+    throw new Error(
+      `Failed to verify test conversation: ${convErr.message}`
+    );
+  }
+
+  if (!convRow || !isTestConversationRow(convRow)) {
+    throw new Error(
+      'Test conversation not found for the selected workspace and agent.'
+    );
+  }
+
+  const [{ data: msgRows, error: msgErr }, { data: feedbackRows }] =
+    await Promise.all([
+      supabase
+        .from('messages')
+        .select('*')
+        .eq('workspace_id', workspaceId)
+        .eq('conversation_id', conversationId)
+        .order('created_at', { ascending: true }),
+      supabase
+        .from('conversation_feedback')
+        .select(
+          'id, workspace_id, agent_id, conversation_id, submitted_by, rating, comment, created_at, message_id, tags'
+        )
+        .eq('workspace_id', workspaceId)
+        .eq('agent_id', agentId)
+        .eq('conversation_id', conversationId)
+        .order('created_at', { ascending: true }),
+    ]);
+
+  if (msgErr) {
+    throw new Error(
+      `Failed to load conversation messages: ${msgErr.message}`
+    );
+  }
+
+  const feedbackByMessageId = new Map<string, any>();
+  for (const fb of feedbackRows || []) {
+    if (fb.message_id) {
+      feedbackByMessageId.set(fb.message_id, fb);
+    }
+  }
+
+  return sortAndMapTestMessages(msgRows || [], feedbackByMessageId);
+}
+
+/**
+ * Starts a completely new persistent Agent Test conversation in `public.conversations`,
+ * generating a new unique database UUID while keeping all previous test conversations intact.
+ * Explicitly sets `connection_id: null` so Agent Test Simulator conversations work
+ * independently of external channel connections.
+ * Returns an empty conversation (`messages: []`) ready for new messages.
+ */
+export async function createSupabaseTestConversation(params: {
+  workspaceId?: string | null;
+  agentId: string;
+  title?: string;
+}): Promise<AgentTestConversation> {
+  if (!supabase) {
+    throw new Error('Supabase client is not configured.');
+  }
+
+  const { userId, workspaceId, agentId } = await verifyAgentAndWorkspaceAccess({
+    workspaceId: params.workspaceId,
+    agentId: params.agentId,
+  });
+
+  const now = new Date().toISOString();
+  const initialTitle = params.title?.trim()
+    ? params.title.trim().slice(0, 60)
+    : 'New Test Conversation';
+
+  const insertWithMetadata = {
+    workspace_id: workspaceId,
+    agent_id: agentId,
+    connection_id: null,
+    customer_name: initialTitle,
+    customer_handle: TEST_CONVERSATION_HANDLE,
+    status: 'open',
+    last_message_at: now,
+    metadata: {
+      is_test: true,
+      conversation_type: 'agent_test',
+      source: 'agent_simulator',
+      platform: 'simulator',
+      agent_id: agentId,
+      created_by: userId,
+      title: initialTitle,
+      lastMessageText: '',
+      unread: false,
+    },
+  };
+
+  let { data: convRow, error: convErr } = await supabase
+    .from('conversations')
+    .insert(insertWithMetadata)
+    .select('*')
+    .single();
+
+  if (
+    convErr &&
+    typeof convErr.message === 'string' &&
+    convErr.message.toLowerCase().includes('metadata')
+  ) {
+    const fallbackInsert = {
+      workspace_id: workspaceId,
+      agent_id: agentId,
+      connection_id: null,
+      customer_name: initialTitle,
+      customer_handle: TEST_CONVERSATION_HANDLE,
+      status: 'open',
+      last_message_at: now,
+    };
+    const retryRes = await supabase
+      .from('conversations')
+      .insert(fallbackInsert)
+      .select('*')
+      .single();
+    convRow = retryRes.data;
+    convErr = retryRes.error;
+  }
+
+  if (convErr || !convRow?.id) {
+    throw new Error(
+      convErr
+        ? `Failed to create test conversation: ${convErr.message}`
+        : 'Failed to create test conversation in Supabase.'
+    );
+  }
+
+  return {
+    id: convRow.id,
+    workspace_id: convRow.workspace_id,
+    agent_id: convRow.agent_id,
+    connection_id: null,
+    title: initialTitle,
+    created_at: convRow.created_at || now,
+    last_message_at: convRow.last_message_at || convRow.created_at || now,
+    last_message_text: '',
+    message_count: 0,
+    messages: [],
+  };
+}
+
+/**
+ * Persists a single user or AI agent message in `public.messages` under a verified test conversation.
+ * Prevents duplicate rows on retry via `clientMessageId` or `existingDbMessageId`,
+ * and updates the parent conversation's `last_message_at` and title in `public.conversations`.
+ */
+export async function saveSupabaseTestMessage(params: {
+  workspaceId?: string | null;
+  agentId: string;
+  conversationId: string;
+  sender: 'customer' | 'agent';
+  content: string;
+  clientMessageId?: string;
+  sequence?: number;
+  existingDbMessageId?: string | null;
+}): Promise<AgentTestMessageRecord> {
+  if (!supabase) {
+    throw new Error('Supabase client is not configured.');
+  }
+
+  const trimmedContent = (params.content || '').trim();
+  if (!trimmedContent) {
+    throw new Error('Message content cannot be empty.');
+  }
+
+  if (!isValidUuid(params.conversationId)) {
+    throw new Error('A valid conversation_id UUID is required to save message.');
+  }
+
+  const { workspaceId, agentId } = await verifyAgentAndWorkspaceAccess({
+    workspaceId: params.workspaceId,
+    agentId: params.agentId,
+  });
+
+  const conversationId = params.conversationId.trim();
+
+  // Verify the target conversation exists, belongs to the verified workspace & agent, and is a simulator conversation
+  const { data: convRow, error: convLookupErr } = await supabase
+    .from('conversations')
+    .select('*')
+    .eq('id', conversationId)
+    .eq('workspace_id', workspaceId)
+    .eq('agent_id', agentId)
+    .maybeSingle();
+
+  if (convLookupErr) {
+    throw new Error(
+      `Failed to verify test conversation: ${convLookupErr.message}`
+    );
+  }
+
+  if (!convRow || !isTestConversationRow(convRow)) {
+    throw new Error(
+      'Target test conversation does not exist or does not belong to this agent and workspace.'
+    );
+  }
+
+  // 1. If existingDbMessageId is provided (e.g. returned by Edge Function or prior save), check if it already exists
+  if (isValidUuid(params.existingDbMessageId)) {
+    const { data: existingById } = await supabase
+      .from('messages')
+      .select('*')
+      .eq('id', params.existingDbMessageId!.trim())
+      .eq('workspace_id', workspaceId)
+      .eq('conversation_id', conversationId)
+      .maybeSingle();
+
+    if (existingById?.id) {
+      return sortAndMapTestMessages([existingById], new Map())[0];
+    }
+  }
+
+  // 2. If clientMessageId is provided, check existing messages in this conversation to prevent duplicate inserts on retry
+  if (params.clientMessageId) {
+    const { data: recentMsgs } = await supabase
+      .from('messages')
+      .select('*')
+      .eq('workspace_id', workspaceId)
+      .eq('conversation_id', conversationId)
+      .order('created_at', { ascending: false })
+      .limit(25);
+
+    const duplicateMatch = (recentMsgs || []).find(
+      (m: any) =>
+        m.metadata?.client_message_id === params.clientMessageId ||
+        (m.sender_type === params.sender &&
+          m.content === trimmedContent &&
+          Date.now() - new Date(m.created_at || 0).getTime() < 15_000 &&
+          m.metadata?.sequence === params.sequence)
+    );
+
+    if (duplicateMatch?.id) {
+      return sortAndMapTestMessages([duplicateMatch], new Map())[0];
+    }
+  }
+
+  const now = new Date().toISOString();
+  const direction = params.sender === 'customer' ? 'inbound' : 'outbound';
+
+  const payloadWithMeta = {
+    workspace_id: workspaceId,
+    conversation_id: conversationId,
+    sender_type: params.sender,
+    direction,
+    content: trimmedContent,
+    metadata: {
+      is_test: true,
+      conversation_type: 'agent_test',
+      agent_id: agentId,
+      ...(params.clientMessageId
+        ? { client_message_id: params.clientMessageId }
+        : {}),
+      ...(typeof params.sequence === 'number'
+        ? { sequence: params.sequence }
+        : {}),
+    },
+  };
+
+  let { data: insertedRow, error: insertErr } = await supabase
+    .from('messages')
+    .insert(payloadWithMeta)
+    .select('*')
+    .single();
+
+  if (
+    insertErr &&
+    typeof insertErr.message === 'string' &&
+    insertErr.message.toLowerCase().includes('metadata')
+  ) {
+    const fallbackPayload = {
+      workspace_id: workspaceId,
+      conversation_id: conversationId,
+      sender_type: params.sender,
+      direction,
+      content: trimmedContent,
+    };
+    const retryRes = await supabase
+      .from('messages')
+      .insert(fallbackPayload)
+      .select('*')
+      .single();
+    insertedRow = retryRes.data;
+    insertErr = retryRes.error;
+  }
+
+  if (insertErr || !insertedRow?.id) {
+    throw new Error(
+      insertErr
+        ? `Failed to save ${
+            params.sender === 'customer' ? 'user' : 'agent'
+          } message to Supabase: ${insertErr.message}`
+        : 'Failed to save message to Supabase.'
+    );
+  }
+
+  // Update the parent test conversation's last_message_at and title (if this is the first user prompt)
+  const isDefaultTitle =
+    !convRow.customer_name ||
+    convRow.customer_name === 'New Test Conversation' ||
+    convRow.customer_name === 'Agent Test Session';
+  const nextTitle =
+    params.sender === 'customer' && isDefaultTitle
+      ? trimmedContent.length > 56
+        ? `${trimmedContent.slice(0, 56)}…`
+        : trimmedContent
+      : convRow.customer_name || 'Agent Test Session';
+
+  const existingMeta =
+    convRow.metadata && typeof convRow.metadata === 'object'
+      ? convRow.metadata
+      : {};
+
+  const convUpdatePayload: Record<string, any> = {
+    connection_id: null,
+    agent_id: agentId,
+    last_message_at: insertedRow.created_at || now,
+    customer_name: nextTitle,
+    customer_handle: TEST_CONVERSATION_HANDLE,
+    metadata: {
+      ...existingMeta,
+      is_test: true,
+      conversation_type: 'agent_test',
+      source: 'agent_simulator',
+      platform: 'simulator',
+      agent_id: agentId,
+      title: nextTitle,
+      lastMessageText: trimmedContent,
+    },
+  };
+
+  const { error: convUpdateErr } = await supabase
+    .from('conversations')
+    .update(convUpdatePayload)
+    .eq('id', conversationId)
+    .eq('workspace_id', workspaceId);
+
+  if (convUpdateErr) {
+    // Fallback minimal update if metadata column is not updated
+    await supabase
+      .from('conversations')
+      .update({
+        connection_id: null,
+        agent_id: agentId,
+        last_message_at: insertedRow.created_at || now,
+        customer_name: nextTitle,
+        customer_handle: TEST_CONVERSATION_HANDLE,
+      })
+      .eq('id', conversationId)
+      .eq('workspace_id', workspaceId);
+  }
+
+  return sortAndMapTestMessages([insertedRow], new Map())[0];
 }
 
 // ==========================================
@@ -454,60 +2723,258 @@ export async function deleteSupabaseConnection(connId: string): Promise<void> {
 export async function getSupabaseConversations(userId: string): Promise<Conversation[]> {
   if (!supabase) return [];
 
-  const { data, error } = await supabase
-    .from('conversations')
-    .select('*, messages(*)')
-    .eq('user_id', userId)
-    .order('last_message_time', { ascending: false });
+  const workspaceId = await getOrCreateUserWorkspace(userId);
+
+  const [{ data, error }, { data: feedbackRows }] = await Promise.all([
+    supabase
+      .from('conversations')
+      .select('*, messages(*)')
+      .eq('workspace_id', workspaceId)
+      .order('last_message_at', { ascending: false }),
+    supabase
+      .from('conversation_feedback')
+      .select(
+        'id, workspace_id, agent_id, conversation_id, submitted_by, rating, comment, created_at, message_id, tags'
+      )
+      .eq('workspace_id', workspaceId)
+      .order('created_at', { ascending: true }),
+  ]);
 
   if (error) {
     console.warn('[Zivofly] Error querying conversations:', error.message);
     throw error;
   }
 
-  return (data || []).map((row: any) => ({
-    id: row.id,
-    agentId: row.agent_id,
-    userId: row.user_id,
-    platform: row.platform,
-    customerName: row.customer_name || 'Customer',
-    customerHandle: row.customer_handle || '',
-    customerAvatar: row.customer_avatar,
-    lastMessageText: row.last_message_text || '',
-    lastMessageTime: row.last_message_time || row.created_at || new Date().toISOString(),
-    unread: row.unread ?? false,
-    status: row.status || 'agent_active',
-    rating: row.rating,
-    feedbackComment: row.feedback_comment,
-    messages: (row.messages || [])
-      .sort((a: any, b: any) => new Date(a.timestamp || a.created_at).getTime() - new Date(b.timestamp || b.created_at).getTime())
-      .map((m: any) => ({
-        id: m.id,
-        sender: m.sender,
-        text: m.text,
-        timestamp: m.timestamp || m.created_at,
-        mediaType: m.media_type,
-        mediaUrl: m.media_url,
-        mediaDescription: m.media_description,
-        rating: m.rating,
-        feedback: m.feedback,
-        feedbackCreatedAt: m.feedback_created_at,
-      })),
-  }));
+  // Index feedback by message_id and conversation_id (ascending order ensures the latest feedback wins)
+  const feedbackByMessageId = new Map<string, any>();
+  const feedbackByConversationId = new Map<string, any>();
+
+  for (const fb of feedbackRows || []) {
+    if (fb.message_id) {
+      feedbackByMessageId.set(fb.message_id, fb);
+    }
+    if (fb.conversation_id) {
+      feedbackByConversationId.set(fb.conversation_id, fb);
+    }
+  }
+
+  // Exclude Agent Test conversations so real customer Inbox conversations stay separate
+  const realCustomerRows = (data || []).filter(
+    (row: any) => !isTestConversationRow(row)
+  );
+
+  return realCustomerRows.map((row: any) => {
+    const meta = row.metadata || {};
+    const convFeedback = feedbackByConversationId.get(row.id);
+
+    const sortedMessages = (row.messages || [])
+      .sort(
+        (a: any, b: any) =>
+          new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+      )
+      .map((m: any) => {
+        const msgMeta = m.metadata || {};
+        const msgFeedback = feedbackByMessageId.get(m.id);
+
+        return {
+          id: m.id,
+          sender: (m.sender_type || 'agent') as 'customer' | 'agent' | 'human',
+          text: m.content || '',
+          timestamp: m.created_at || new Date().toISOString(),
+          mediaType: m.media_type,
+          mediaUrl: m.media_url,
+          mediaDescription: m.media_description,
+          rating: msgFeedback ? Number(msgFeedback.rating) : msgMeta.rating,
+          feedback: msgFeedback
+            ? msgFeedback.comment ?? ''
+            : msgMeta.feedback,
+          feedbackTags: msgFeedback && Array.isArray(msgFeedback.tags)
+            ? msgFeedback.tags
+            : Array.isArray(msgMeta.feedbackTags)
+            ? msgMeta.feedbackTags
+            : [],
+          feedbackId: msgFeedback ? msgFeedback.id : undefined,
+          feedbackCreatedAt: msgFeedback
+            ? msgFeedback.created_at
+            : msgMeta.feedbackCreatedAt,
+        };
+      });
+
+    const latestMsg = sortedMessages[sortedMessages.length - 1];
+
+    return {
+      id: row.id,
+      agentId: row.agent_id || '',
+      userId,
+      platform: meta.platform || 'whatsapp',
+      customerName: row.customer_name || 'Customer',
+      customerHandle: row.customer_handle || '',
+      customerAvatar: meta.customerAvatar,
+      lastMessageText: latestMsg?.text || meta.lastMessageText || '',
+      lastMessageTime: row.last_message_at || row.created_at || new Date().toISOString(),
+      unread: meta.unread ?? false,
+      status: row.status === 'human_takeover' ? 'human_takeover' : 'agent_active',
+      rating: convFeedback ? Number(convFeedback.rating) : meta.rating,
+      feedbackComment: convFeedback
+        ? convFeedback.comment ?? ''
+        : meta.feedbackComment,
+      feedbackTags:
+        convFeedback && Array.isArray(convFeedback.tags)
+          ? convFeedback.tags
+          : [],
+      feedbackId: convFeedback ? convFeedback.id : undefined,
+      messages: sortedMessages,
+    };
+  });
+}
+
+export async function createSupabaseConversation(
+  userId: string,
+  params: {
+    agentId?: string;
+    connectionId?: string;
+    platform?: string;
+    customerName?: string;
+    customerHandle?: string;
+    message?: string;
+  }
+): Promise<Conversation> {
+  if (!supabase) throw new Error('Supabase client not configured');
+
+  if (
+    typeof params.customerHandle === 'string' &&
+    params.customerHandle.trim() === TEST_CONVERSATION_HANDLE
+  ) {
+    throw new Error(
+      'Customer conversations cannot use the internal Agent Test Simulator handle.'
+    );
+  }
+
+  const workspaceId = await getOrCreateUserWorkspace(userId);
+  const validAgentId = isValidUuid(params.agentId) ? params.agentId!.trim() : null;
+
+  // Real customer conversations require a valid channel connection belonging to the same workspace
+  let resolvedConnectionId: string | null = null;
+  if (isValidUuid(params.connectionId)) {
+    const { data: connRow, error: connErr } = await supabase
+      .from('channel_connections')
+      .select('id, workspace_id')
+      .eq('id', params.connectionId!.trim())
+      .eq('workspace_id', workspaceId)
+      .maybeSingle();
+
+    if (connErr || !connRow?.id) {
+      throw new Error('Channel connection must belong to the same workspace');
+    }
+    resolvedConnectionId = connRow.id;
+  } else {
+    let connQuery = supabase
+      .from('channel_connections')
+      .select('id, workspace_id, agent_id, channel')
+      .eq('workspace_id', workspaceId)
+      .order('created_at', { ascending: false });
+
+    if (validAgentId) {
+      connQuery = connQuery.eq('agent_id', validAgentId);
+    } else if (params.platform) {
+      connQuery = connQuery.eq('channel', params.platform);
+    }
+
+    const { data: connRows } = await connQuery.limit(1);
+    if (connRows && connRows[0]?.id) {
+      resolvedConnectionId = connRows[0].id;
+    } else {
+      throw new Error('Channel connection must belong to the same workspace');
+    }
+  }
+
+  const now = new Date().toISOString();
+  const initialText = params.message || 'Hello!';
+
+  const { data: convRow, error: convErr } = await supabase
+    .from('conversations')
+    .insert({
+      workspace_id: workspaceId,
+      connection_id: resolvedConnectionId,
+      agent_id: validAgentId,
+      customer_name: params.customerName || 'New Customer',
+      customer_handle: params.customerHandle || '@customer',
+      status: 'agent_active',
+      last_message_at: now,
+      metadata: {
+        platform: params.platform || 'whatsapp',
+        lastMessageText: initialText,
+        unread: false,
+      },
+    })
+    .select('*')
+    .single();
+
+  if (convErr) throw convErr;
+
+  const { data: msgRow } = await supabase
+    .from('messages')
+    .insert({
+      workspace_id: workspaceId,
+      conversation_id: convRow.id,
+      sender_type: 'customer',
+      direction: 'inbound',
+      content: initialText,
+    })
+    .select('*')
+    .single();
+
+  return {
+    id: convRow.id,
+    agentId: convRow.agent_id || '',
+    userId,
+    platform: (params.platform as any) || 'whatsapp',
+    customerName: convRow.customer_name,
+    customerHandle: convRow.customer_handle,
+    lastMessageText: initialText,
+    lastMessageTime: now,
+    unread: false,
+    status: 'agent_active',
+    messages: msgRow
+      ? [
+          {
+            id: msgRow.id,
+            sender: 'customer',
+            text: msgRow.content,
+            timestamp: msgRow.created_at,
+          },
+        ]
+      : [],
+  };
 }
 
 export async function sendSupabaseMessage(
   conversationId: string,
   text: string,
-  sender: 'customer' | 'agent' | 'human' = 'agent'
+  sender: 'customer' | 'agent' | 'human' = 'agent',
+  userId?: string
 ): Promise<ChatMessage> {
   if (!supabase) throw new Error('Supabase client not configured');
 
+  let workspaceId: string | undefined;
+  if (userId) {
+    workspaceId = await getOrCreateUserWorkspace(userId);
+  } else {
+    const { data: conv } = await supabase
+      .from('conversations')
+      .select('workspace_id')
+      .eq('id', conversationId)
+      .maybeSingle();
+    workspaceId = conv?.workspace_id;
+  }
+
+  const now = new Date().toISOString();
   const msgPayload = {
+    workspace_id: workspaceId,
     conversation_id: conversationId,
-    sender,
-    text,
-    timestamp: new Date().toISOString(),
+    sender_type: sender,
+    direction: sender === 'customer' ? 'inbound' : 'outbound',
+    content: text,
   };
 
   const { data, error } = await supabase
@@ -518,19 +2985,732 @@ export async function sendSupabaseMessage(
 
   if (error) throw error;
 
-  // Update conversation last_message
   await supabase
     .from('conversations')
     .update({
-      last_message_text: text,
-      last_message_time: msgPayload.timestamp,
+      last_message_at: now,
+      updated_at: now,
     })
     .eq('id', conversationId);
 
   return {
     id: data.id,
-    sender: data.sender,
-    text: data.text,
-    timestamp: data.timestamp,
+    sender: (data.sender_type || sender) as 'customer' | 'agent' | 'human',
+    text: data.content,
+    timestamp: data.created_at || now,
+  };
+}
+
+// ==========================================
+// GOOGLE WORKSPACE OAUTH & INTEGRATION CONNECTIONS
+// ==========================================
+
+export type GoogleWorkspaceUiKey =
+  | 'gmail'
+  | 'drive'
+  | 'docs'
+  | 'sheets'
+  | 'calendar';
+
+export const GOOGLE_WORKSPACE_PROVIDER_KEYS: readonly GoogleWorkspaceServiceIdentifier[] = [
+  'gmail',
+  'google_drive',
+  'google_docs',
+  'google_sheets_service',
+  'google_calendar',
+] as const;
+
+export const GOOGLE_WORKSPACE_SERVICE_MAP: Record<
+  GoogleWorkspaceUiKey,
+  GoogleWorkspaceServiceIdentifier
+> = {
+  gmail: 'gmail',
+  drive: 'google_drive',
+  docs: 'google_docs',
+  sheets: 'google_sheets_service',
+  calendar: 'google_calendar',
+};
+
+export const GOOGLE_WORKSPACE_PROVIDER_TO_UI_KEY: Record<
+  GoogleWorkspaceServiceIdentifier,
+  GoogleWorkspaceUiKey
+> = {
+  gmail: 'gmail',
+  google_drive: 'drive',
+  google_docs: 'docs',
+  google_sheets_service: 'sheets',
+  google_calendar: 'calendar',
+};
+
+export const GOOGLE_WORKSPACE_SERVICE_LABELS: Record<
+  GoogleWorkspaceServiceIdentifier,
+  string
+> = {
+  gmail: 'Gmail',
+  google_drive: 'Google Drive',
+  google_docs: 'Google Docs',
+  google_sheets_service: 'Google Sheets',
+  google_calendar: 'Google Calendar',
+};
+
+export const GOOGLE_OAUTH_RETURN_STORAGE_KEY = 'zivofly_google_oauth_return';
+
+// Guard to prevent duplicate concurrent OAuth start requests
+const inFlightGoogleOAuthServices = new Set<string>();
+
+// Guard to ensure an OAuth callback query string is processed only once per redirect
+let lastProcessedGoogleOAuthQuery: string | null = null;
+
+export function isGoogleWorkspaceServiceIdentifier(
+  val?: string | null
+): val is GoogleWorkspaceServiceIdentifier {
+  if (!val || typeof val !== 'string') return false;
+  return (GOOGLE_WORKSPACE_PROVIDER_KEYS as readonly string[]).includes(
+    val.trim()
+  );
+}
+
+export interface GoogleIntegrationConnectionRecord {
+  id: string;
+  workspace_id: string;
+  provider_key: GoogleWorkspaceServiceIdentifier;
+  display_name: string | null;
+  status: GoogleWorkspaceIntegrationStatus;
+  account_email: string | null;
+  external_account_id: string | null;
+  external_account_name: string | null;
+  scopes: string[];
+  connected_by: string | null;
+  last_error: string | null;
+  last_synced_at: string | null;
+  metadata: Record<string, any>;
+  created_at: string;
+  updated_at: string;
+}
+
+function normalizeIntegrationStatus(
+  rawStatus?: string | null
+): GoogleWorkspaceIntegrationStatus {
+  const s = typeof rawStatus === 'string' ? rawStatus.trim().toLowerCase() : '';
+  if (s === 'connected') return 'connected';
+  if (s === 'expired') return 'expired';
+  if (s === 'error' || s === 'failed') return 'error';
+  return 'disconnected';
+}
+
+function extractGoogleAccountEmail(row: any): string | null {
+  if (!row) return null;
+  const meta =
+    row.metadata && typeof row.metadata === 'object' ? row.metadata : {};
+
+  const candidates = [
+    meta.email,
+    meta.account_email,
+    meta.google_email,
+    meta.user_email,
+    row.external_account_name,
+    typeof row.external_account_id === 'string' &&
+    row.external_account_id.includes('@')
+      ? row.external_account_id
+      : null,
+    typeof row.display_name === 'string' && row.display_name.includes('@')
+      ? row.display_name
+      : null,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim().length > 0) {
+      return candidate.trim();
+    }
+  }
+
+  return null;
+}
+
+function mapIntegrationConnectionRow(
+  row: any
+): GoogleIntegrationConnectionRecord | null {
+  if (!row || !isGoogleWorkspaceServiceIdentifier(row.provider_key)) {
+    return null;
+  }
+
+  const meta =
+    row.metadata && typeof row.metadata === 'object' ? row.metadata : {};
+
+  return {
+    id: row.id,
+    workspace_id: row.workspace_id,
+    provider_key: row.provider_key,
+    display_name: row.display_name || null,
+    status: normalizeIntegrationStatus(row.status),
+    account_email: extractGoogleAccountEmail(row),
+    external_account_id: row.external_account_id || null,
+    external_account_name: row.external_account_name || null,
+    scopes: Array.isArray(row.scopes) ? row.scopes : [],
+    connected_by: row.connected_by || null,
+    last_error:
+      typeof row.last_error === 'string' && row.last_error.trim()
+        ? row.last_error.trim()
+        : typeof meta.error === 'string' && meta.error.trim()
+        ? meta.error.trim()
+        : null,
+    last_synced_at: row.last_synced_at || row.updated_at || null,
+    metadata: meta,
+    created_at: row.created_at || new Date().toISOString(),
+    updated_at: row.updated_at || row.created_at || new Date().toISOString(),
+  };
+}
+
+/**
+ * Resolves and verifies the active workspace ID for the currently authenticated Supabase user.
+ * Never returns a hardcoded or demo workspace ID.
+ */
+export async function resolveActiveGoogleWorkspaceId(params?: {
+  workspaceId?: string | null;
+  agentId?: string | null;
+}): Promise<{
+  workspaceId: string;
+  userId: string;
+  accessToken: string;
+}> {
+  if (!supabase) {
+    throw new Error('Supabase client is not configured.');
+  }
+
+  const { userId, accessToken } = await getVerifiedSupabaseAccessToken();
+
+  let candidateWorkspaceId: string | null = isValidUuid(params?.workspaceId)
+    ? params!.workspaceId!.trim()
+    : null;
+
+  if (!candidateWorkspaceId && isValidUuid(params?.agentId)) {
+    const { data: agentRow, error: agentErr } = await supabase
+      .from('agents')
+      .select('id, workspace_id')
+      .eq('id', params!.agentId!.trim())
+      .maybeSingle();
+
+    if (agentErr) {
+      throw new Error(`Failed to resolve agent workspace: ${agentErr.message}`);
+    }
+
+    if (agentRow && isValidUuid(agentRow.workspace_id)) {
+      candidateWorkspaceId = agentRow.workspace_id;
+    }
+  }
+
+  if (candidateWorkspaceId) {
+    const [
+      { data: wsOwnerRow, error: wsOwnerErr },
+      { data: wsMemberRow, error: wsMemberErr },
+    ] = await Promise.all([
+      supabase
+        .from('workspaces')
+        .select('id, owner_user_id')
+        .eq('id', candidateWorkspaceId)
+        .maybeSingle(),
+      supabase
+        .from('workspace_members')
+        .select('workspace_id, user_id')
+        .eq('workspace_id', candidateWorkspaceId)
+        .eq('user_id', userId)
+        .maybeSingle(),
+    ]);
+
+    if (wsOwnerErr && wsMemberErr) {
+      throw new Error(
+        `Failed to verify workspace permissions: ${wsOwnerErr.message}`
+      );
+    }
+
+    const isOwner = wsOwnerRow?.owner_user_id === userId;
+    const isMember = Boolean(wsMemberRow?.workspace_id);
+
+    if (!isOwner && !isMember) {
+      throw new Error(
+        'Authenticated user does not have permission to manage integrations in this workspace.'
+      );
+    }
+
+    return {
+      workspaceId: candidateWorkspaceId,
+      userId,
+      accessToken,
+    };
+  }
+
+  const resolvedWorkspaceId = await getOrCreateUserWorkspace(userId);
+  if (!isValidUuid(resolvedWorkspaceId)) {
+    throw new Error(
+      'Could not resolve a valid active workspace ID for the authenticated user.'
+    );
+  }
+
+  return {
+    workspaceId: resolvedWorkspaceId,
+    userId,
+    accessToken,
+  };
+}
+
+export function createEmptyGoogleConnectionsMap(): Record<
+  GoogleWorkspaceServiceIdentifier,
+  GoogleIntegrationConnectionRecord | null
+> {
+  return {
+    gmail: null,
+    google_drive: null,
+    google_docs: null,
+    google_sheets_service: null,
+    google_calendar: null,
+  };
+}
+
+/**
+ * Queries `public.integration_connections` for the active workspace and the 5 Google Workspace provider keys:
+ * - `gmail`
+ * - `google_drive`
+ * - `google_docs`
+ * - `google_sheets_service`
+ * - `google_calendar`
+ */
+export async function getGoogleWorkspaceIntegrationConnections(params?: {
+  workspaceId?: string | null;
+  agentId?: string | null;
+}): Promise<{
+  workspaceId: string;
+  connectionsByService: Record<
+    GoogleWorkspaceServiceIdentifier,
+    GoogleIntegrationConnectionRecord | null
+  >;
+}> {
+  if (!supabase) {
+    throw new Error('Supabase client is not configured.');
+  }
+
+  const { workspaceId } = await resolveActiveGoogleWorkspaceId(params);
+
+  const { data, error } = await supabase
+    .from('integration_connections')
+    .select(
+      'id, workspace_id, provider_key, display_name, status, external_account_id, external_account_name, scopes, connected_by, last_error, last_synced_at, metadata, created_at, updated_at'
+    )
+    .eq('workspace_id', workspaceId)
+    .in('provider_key', [...GOOGLE_WORKSPACE_PROVIDER_KEYS])
+    .order('updated_at', { ascending: false });
+
+  if (error) {
+    throw new Error(
+      `Failed to load Google Workspace integration status: ${error.message}`
+    );
+  }
+
+  const connectionsByService = createEmptyGoogleConnectionsMap();
+
+  for (const row of data || []) {
+    if (row.workspace_id !== workspaceId) continue;
+    const mapped = mapIntegrationConnectionRow(row);
+    if (!mapped) continue;
+    // Keep the most recently updated record per provider_key
+    if (!connectionsByService[mapped.provider_key]) {
+      connectionsByService[mapped.provider_key] = mapped;
+    }
+  }
+
+  return {
+    workspaceId,
+    connectionsByService,
+  };
+}
+
+/**
+ * Maps the actual `public.integration_connections` records onto `GoogleWorkspaceConfig`.
+ * Ensures that only real database records determine connection status and account email,
+ * while preserving any existing Google Sheet column configuration on `sheets`.
+ */
+export function syncGoogleWorkspaceConfigWithRecords(
+  currentConfig: GoogleWorkspaceConfig | undefined,
+  connectionsByService: Record<
+    GoogleWorkspaceServiceIdentifier,
+    GoogleIntegrationConnectionRecord | null
+  >
+): GoogleWorkspaceConfig {
+  const buildAppEntry = (
+    serviceKey: GoogleWorkspaceServiceIdentifier
+  ): NonNullable<GoogleWorkspaceConfig['gmail']> => {
+    const rec = connectionsByService[serviceKey];
+    if (!rec) {
+      return {
+        enabled: false,
+        status: 'disconnected',
+        accountEmail: undefined,
+        connectionId: undefined,
+        lastError: null,
+      };
+    }
+
+    return {
+      enabled: rec.status === 'connected',
+      status: rec.status,
+      accountEmail: rec.account_email || undefined,
+      connectionId: rec.id,
+      lastError: rec.last_error,
+      connectedAt: rec.created_at,
+      lastSyncedAt: rec.last_synced_at || rec.updated_at,
+    };
+  };
+
+  const sheetsRecord = connectionsByService.google_sheets_service;
+  const existingSheets = currentConfig?.sheets || {
+    enabled: false,
+    columns: [],
+    sheetName: 'Sheet1',
+  };
+
+  return {
+    gmail: buildAppEntry('gmail'),
+    drive: buildAppEntry('google_drive'),
+    docs: buildAppEntry('google_docs'),
+    sheets: {
+      ...existingSheets,
+      enabled: sheetsRecord?.status === 'connected',
+      status: sheetsRecord ? sheetsRecord.status : 'disconnected',
+      accountEmail: sheetsRecord?.account_email || undefined,
+      connectionId: sheetsRecord?.id,
+      lastError: sheetsRecord?.last_error || null,
+      connectedAt: sheetsRecord?.created_at,
+      lastSyncedAt:
+        sheetsRecord?.last_synced_at ||
+        sheetsRecord?.updated_at ||
+        existingSheets.lastSyncedAt,
+    },
+    calendar: buildAppEntry('google_calendar'),
+  };
+}
+
+/**
+ * Initiates the Google Workspace OAuth flow for one of the 5 services by invoking
+ * the deployed `google_workspace` Supabase Edge Function:
+ * `{ action: "start", workspace_id, service }`
+ */
+export async function startGoogleWorkspaceOAuth(params: {
+  service: GoogleWorkspaceServiceIdentifier;
+  workspaceId?: string | null;
+  agentId?: string | null;
+}): Promise<{
+  authorizationUrl: string;
+  workspaceId: string;
+  service: GoogleWorkspaceServiceIdentifier;
+}> {
+  if (!supabase) {
+    throw new Error('Supabase client is not configured.');
+  }
+
+  if (!isGoogleWorkspaceServiceIdentifier(params.service)) {
+    throw new Error(
+      `Invalid Google Workspace service identifier: "${params.service}".`
+    );
+  }
+
+  const service = params.service;
+  if (inFlightGoogleOAuthServices.has(service)) {
+    throw new Error(
+      `An authorization request for ${GOOGLE_WORKSPACE_SERVICE_LABELS[service]} is already in progress.`
+    );
+  }
+
+  inFlightGoogleOAuthServices.add(service);
+
+  try {
+    const { workspaceId, accessToken } = await resolveActiveGoogleWorkspaceId({
+      workspaceId: params.workspaceId,
+      agentId: params.agentId,
+    });
+
+    if (!isValidUuid(workspaceId)) {
+      throw new Error(
+        'A valid active workspace ID is required to connect Google Workspace.'
+      );
+    }
+
+    // Invoke deployed `google_workspace` Edge Function with the authenticated user's session token
+    const { data, error } = await supabase.functions.invoke(
+      'google_workspace',
+      {
+        body: {
+          action: 'start',
+          workspace_id: workspaceId,
+          service,
+        },
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+      }
+    );
+
+    if (error) {
+      const diag = await extractEdgeFunctionDiagnosticError(
+        error,
+        data?.error || data?.message
+      );
+      throw new Error(diag.message || diag.formatted);
+    }
+
+    if (data?.error) {
+      const errMsg =
+        typeof data.error === 'string'
+          ? data.error
+          : JSON.stringify(data.error);
+      throw new Error(errMsg);
+    }
+
+    const authorizationUrl =
+      typeof data?.authorization_url === 'string'
+        ? data.authorization_url.trim()
+        : '';
+
+    if (
+      !authorizationUrl ||
+      (!authorizationUrl.startsWith('https://') &&
+        !authorizationUrl.startsWith('http://'))
+    ) {
+      throw new Error(
+        'The Google Workspace service did not return a valid authorization_url.'
+      );
+    }
+
+    // Save return navigation context so the callback restores the exact Agent Tools view
+    try {
+      sessionStorage.setItem(
+        GOOGLE_OAUTH_RETURN_STORAGE_KEY,
+        JSON.stringify({
+          path: window.location.pathname,
+          tab: 'tools',
+          workspaceId,
+          agentId: params.agentId || null,
+          service,
+          createdAt: Date.now(),
+        })
+      );
+    } catch {
+      // Ignore storage quota errors
+    }
+
+    return {
+      authorizationUrl,
+      workspaceId,
+      service,
+    };
+  } finally {
+    inFlightGoogleOAuthServices.delete(service);
+  }
+}
+
+export interface GoogleOAuthCallbackResult {
+  handled: boolean;
+  outcome?: 'success' | 'error';
+  service?: GoogleWorkspaceServiceIdentifier;
+  serviceLabel?: string;
+  email?: string | null;
+  connectionId?: string | null;
+  message?: string;
+  workspaceId?: string;
+  connectionsByService?: Record<
+    GoogleWorkspaceServiceIdentifier,
+    GoogleIntegrationConnectionRecord | null
+  >;
+}
+
+/**
+ * Strips Google OAuth callback query parameters (`google_oauth`, `service`, `email`, `connection_id`, `reason`)
+ * from the browser URL so refreshing the page does not repeat callback handling or notifications.
+ */
+export function clearGoogleOAuthUrlParams(): void {
+  const url = new URL(window.location.href);
+  const keysToRemove = [
+    'google_oauth',
+    'service',
+    'email',
+    'connection_id',
+    'reason',
+  ];
+  let modified = false;
+  for (const key of keysToRemove) {
+    if (url.searchParams.has(key)) {
+      url.searchParams.delete(key);
+      modified = true;
+    }
+  }
+  if (modified) {
+    const nextSearch = url.searchParams.toString();
+    const cleanUrl = `${url.pathname}${nextSearch ? `?${nextSearch}` : ''}${url.hash || ''}`;
+    window.history.replaceState({}, '', cleanUrl);
+  }
+}
+
+/**
+ * Inspects the current browser URL for Google OAuth callback query parameters:
+ * - Success: `google_oauth=success`, `service`, `email`, `connection_id`
+ * - Failure: `google_oauth=error`, `reason`
+ *
+ * IMPORTANT: Never trusts the frontend redirect parameters alone.
+ * Queries `public.integration_connections` in Supabase to confirm the saved connection
+ * and its actual status (`status === 'connected'`).
+ */
+export async function processGoogleWorkspaceOAuthCallbackFromUrl(params?: {
+  workspaceId?: string | null;
+  agentId?: string | null;
+}): Promise<GoogleOAuthCallbackResult> {
+  const currentSearch = window.location.search || '';
+  if (!currentSearch) {
+    return { handled: false };
+  }
+
+  const searchParams = new URLSearchParams(currentSearch);
+  const oauthStatus = searchParams.get('google_oauth')?.trim().toLowerCase();
+
+  if (oauthStatus !== 'success' && oauthStatus !== 'error') {
+    return { handled: false };
+  }
+
+  if (lastProcessedGoogleOAuthQuery === currentSearch) {
+    clearGoogleOAuthUrlParams();
+    return { handled: false };
+  }
+  lastProcessedGoogleOAuthQuery = currentSearch;
+
+  const rawService = searchParams.get('service')?.trim() || '';
+  const rawEmail = searchParams.get('email')?.trim() || null;
+  const rawConnectionId = searchParams.get('connection_id')?.trim() || null;
+  const rawReason = searchParams.get('reason')?.trim() || '';
+
+  // Clean URL parameters immediately so page refresh will not re-trigger the callback toast
+  clearGoogleOAuthUrlParams();
+  try {
+    sessionStorage.removeItem(GOOGLE_OAUTH_RETURN_STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+
+  const validService = isGoogleWorkspaceServiceIdentifier(rawService)
+    ? rawService
+    : undefined;
+  const serviceLabel = validService
+    ? GOOGLE_WORKSPACE_SERVICE_LABELS[validService]
+    : 'Google Workspace';
+
+  if (oauthStatus === 'error') {
+    const formattedReason = rawReason
+      ? decodeURIComponent(rawReason).replace(/_/g, ' ')
+      : 'Authorization was cancelled or could not be completed.';
+
+    let connectionsByService:
+      | Record<
+          GoogleWorkspaceServiceIdentifier,
+          GoogleIntegrationConnectionRecord | null
+        >
+      | undefined;
+    let workspaceId: string | undefined;
+
+    try {
+      const refreshed = await getGoogleWorkspaceIntegrationConnections(params);
+      workspaceId = refreshed.workspaceId;
+      connectionsByService = refreshed.connectionsByService;
+    } catch {
+      // Keep existing state if user is not authenticated
+    }
+
+    return {
+      handled: true,
+      outcome: 'error',
+      service: validService,
+      serviceLabel,
+      message: `Failed to connect ${serviceLabel}: ${formattedReason}`,
+      workspaceId,
+      connectionsByService,
+    };
+  }
+
+  // Handle `google_oauth=success`
+  if (!validService) {
+    return {
+      handled: true,
+      outcome: 'error',
+      message:
+        'Google OAuth callback returned an unrecognized service identifier.',
+    };
+  }
+
+  if (rawConnectionId && !isValidUuid(rawConnectionId)) {
+    return {
+      handled: true,
+      outcome: 'error',
+      service: validService,
+      serviceLabel,
+      message:
+        'Google OAuth callback returned an invalid connection_id parameter.',
+    };
+  }
+
+  // Query actual `public.integration_connections` rows from Supabase to confirm the saved connection
+  const { workspaceId, connectionsByService } =
+    await getGoogleWorkspaceIntegrationConnections(params);
+
+  let verifiedRecord = connectionsByService[validService];
+
+  // If connection_id was specified, verify the exact row in `public.integration_connections`
+  if (rawConnectionId && supabase) {
+    const { data: exactRow } = await supabase
+      .from('integration_connections')
+      .select(
+        'id, workspace_id, provider_key, display_name, status, external_account_id, external_account_name, scopes, connected_by, last_error, last_synced_at, metadata, created_at, updated_at'
+      )
+      .eq('id', rawConnectionId)
+      .eq('workspace_id', workspaceId)
+      .eq('provider_key', validService)
+      .maybeSingle();
+
+    const mappedExact = mapIntegrationConnectionRow(exactRow);
+    if (mappedExact) {
+      verifiedRecord = mappedExact;
+      connectionsByService[validService] = mappedExact;
+    }
+  }
+
+  if (!verifiedRecord || verifiedRecord.status !== 'connected') {
+    const statusDesc = verifiedRecord
+      ? `status is "${verifiedRecord.status}"${
+          verifiedRecord.last_error ? ` (${verifiedRecord.last_error})` : ''
+        }`
+      : 'no saved connection record was found in Supabase';
+
+    return {
+      handled: true,
+      outcome: 'error',
+      service: validService,
+      serviceLabel,
+      workspaceId,
+      connectionsByService,
+      message: `Could not verify ${serviceLabel} connection in Supabase (${statusDesc}).`,
+    };
+  }
+
+  const confirmedEmail = verifiedRecord.account_email || rawEmail || null;
+  if (confirmedEmail && !verifiedRecord.account_email) {
+    verifiedRecord.account_email = confirmedEmail;
+  }
+
+  return {
+    handled: true,
+    outcome: 'success',
+    service: validService,
+    serviceLabel,
+    email: confirmedEmail,
+    connectionId: verifiedRecord.id,
+    workspaceId,
+    connectionsByService,
+    message: confirmedEmail
+      ? `Connected ${serviceLabel} (${confirmedEmail}) successfully!`
+      : `Connected ${serviceLabel} successfully!`,
   };
 }
