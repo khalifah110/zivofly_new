@@ -29,6 +29,8 @@ import {
   RefreshCw,
   MessageSquare,
   History,
+  Pause,
+  Play,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import {
@@ -48,6 +50,7 @@ import {
   NotificationsConfig,
   PlatformType,
   WhatItRepliesToConfig,
+  HumanHandoffConfig,
   ChannelConnection,
 } from '../types';
 import { apiFetch } from '../lib/api';
@@ -57,6 +60,7 @@ import {
   AgentTestMessageRecord,
   CONFIG_DOC_TITLE,
   createSupabaseTestConversation,
+  deleteSupabaseTestConversation,
   extractEdgeFunctionDiagnosticError,
   getSupabaseTestConversationMessages,
   getSupabaseTestConversations,
@@ -80,6 +84,10 @@ import { WhatItRepliesToSection } from '../components/WhatItRepliesToSection';
 import { DeleteAgentModal } from '../components/DeleteAgentModal';
 import { SimulatorMessageBubble, SimulatorMessage } from '../components/SimulatorMessageBubble';
 import { CustomAgentVoiceSection } from '../components/CustomAgentVoiceSection';
+import {
+  HumanHandoffSection,
+  DEFAULT_HUMAN_HANDOFF_CONFIG,
+} from '../components/HumanHandoffSection';
 import { TikTokLogo } from '../components/BrandLogos';
 
 interface AgentDetailPageProps {
@@ -134,11 +142,15 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
   const [openingLine, setOpeningLine] = useState(agent?.openingLine || '');
   const [tone, setTone] = useState(agent?.tone || '');
   const [customVoice, setCustomVoice] = useState<CustomVoiceConfig | undefined>(agent?.customVoice);
+  const [humanHandoff, setHumanHandoff] = useState<HumanHandoffConfig>(
+    () => agent?.humanHandoff || DEFAULT_HUMAN_HANDOFF_CONFIG
+  );
   const [isActive, setIsActive] = useState(agent?.status ? agent.status === 'active' : true);
   const [saving, setSaving] = useState(false);
 
-  // Three-dot menu and deletion states
+  // Three-dot menu, chat history dropdown, and deletion states
   const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const [isChatHistoryOpen, setIsChatHistoryOpen] = useState(false);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
 
@@ -239,10 +251,11 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
   useEffect(() => {
     const handleOutsideClick = () => {
       if (isMenuOpen) setIsMenuOpen(false);
+      if (isChatHistoryOpen) setIsChatHistoryOpen(false);
     };
     window.addEventListener('click', handleOutsideClick);
     return () => window.removeEventListener('click', handleOutsideClick);
-  }, [isMenuOpen]);
+  }, [isMenuOpen, isChatHistoryOpen]);
 
   // Platforms state
   const [platforms, setPlatforms] = useState<PlatformType[]>(() => {
@@ -376,6 +389,7 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
   const [testConversations, setTestConversations] = useState<AgentTestConversation[]>([]);
   const [isLoadingTestHistory, setIsLoadingTestHistory] = useState(false);
   const [isCreatingConversation, setIsCreatingConversation] = useState(false);
+  const [deletingTestConvId, setDeletingTestConvId] = useState<string | null>(null);
   const chatScrollContainerRef = useRef<HTMLDivElement | null>(null);
   const activeAgentIdRef = useRef<string | null>(agent?.id || null);
   activeAgentIdRef.current = agent?.id || null;
@@ -518,6 +532,7 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
             openingLine: openingLine.trim(),
             tone: tone.trim(),
             customVoice,
+            humanHandoff,
             description: roleAndDuties.trim() || 'AI Customer Support Agent',
             status: isActive ? 'active' : 'paused',
             platforms,
@@ -592,6 +607,7 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
           openingLine: openingLine.trim(),
           tone: tone.trim(),
           customVoice,
+          humanHandoff,
           status: isActive ? 'active' : 'paused',
           platforms,
           whatItRepliesTo,
@@ -1371,6 +1387,63 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
   };
 
   /**
+   * Deletes a saved test conversation from the Chat History dropdown.
+   */
+  const handleDeleteTestConversation = async (
+    targetConvId: string,
+    e: React.MouseEvent
+  ) => {
+    e.stopPropagation();
+    if (
+      !isValidUuid(targetConvId) ||
+      deletingTestConvId === targetConvId ||
+      isWaitingReply ||
+      isCreatingConversation
+    ) {
+      return;
+    }
+
+    setDeletingTestConvId(targetConvId);
+    setSimulatorError(null);
+
+    try {
+      const { workspaceId, agentId: currentAgentId } =
+        await resolveKnowledgeWorkspaceAndAgent();
+
+      await deleteSupabaseTestConversation({
+        workspaceId,
+        agentId: currentAgentId,
+        conversationId: targetConvId,
+      });
+
+      const remaining = testConversations.filter((c) => c.id !== targetConvId);
+      setTestConversations(remaining);
+
+      if (simulatorConversationId === targetConvId) {
+        if (remaining.length > 0) {
+          const nextConv = remaining[0];
+          setSimulatorConversationId(nextConv.id);
+          setChatMessages(
+            nextConv.messages.map(mapTestRecordToSimulatorMessage)
+          );
+          scrollTestChatToBottom();
+        } else {
+          setSimulatorConversationId(null);
+          setChatMessages([]);
+          setIsChatHistoryOpen(false);
+        }
+      }
+
+      toast.success('Chat deleted from history');
+    } catch (err: any) {
+      const errMsg = err?.message || 'Failed to delete chat conversation.';
+      toast.error(errMsg);
+    } finally {
+      setDeletingTestConvId(null);
+    }
+  };
+
+  /**
    * Retries saving a message whose persistence to `public.messages` previously failed,
    * without losing the message or creating duplicates.
    */
@@ -1880,6 +1953,72 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
     }
   };
 
+  const handleTogglePauseAgent = async () => {
+    if (!agent || saving) return;
+    const nextActive = !isActive;
+    const nextStatus = nextActive ? 'active' : 'paused';
+    setIsMenuOpen(false);
+    setSaving(true);
+
+    try {
+      const updatedAgent: Agent = {
+        ...agent,
+        name: name.trim() || agent.name,
+        roleAndDuties: roleAndDuties.trim() || agent.roleAndDuties,
+        openingLine: openingLine.trim(),
+        tone: tone.trim(),
+        customVoice,
+        humanHandoff,
+        status: nextStatus,
+        platforms,
+        whatItRepliesTo,
+        knowledgeDocs: docs,
+        tools: {
+          googleSheet: googleWorkspaceConfig?.sheets || sheetToolConfig,
+          googleWorkspace: googleWorkspaceConfig,
+          microsoft365: microsoft365Config,
+          salesforce: salesforceConfig,
+          hubspot: hubspotConfig,
+          notifications: notificationsConfig,
+        },
+        availability: {
+          is24x7,
+          startHour,
+          endHour,
+          timezone,
+          activeDays,
+        },
+      };
+
+      const res = await apiFetch(`/api/agents/${agent.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updatedAgent),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        setIsActive(nextActive);
+        onAgentUpdated(data.agent);
+        toast.success(
+          nextActive
+            ? `Agent "${agent.name}" resumed`
+            : `Agent "${agent.name}" paused`
+        );
+      } else {
+        toast.error(
+          nextActive ? 'Failed to resume agent' : 'Failed to pause agent'
+        );
+      }
+    } catch {
+      toast.error(
+        nextActive ? 'Could not resume agent' : 'Could not pause agent'
+      );
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
   return (
@@ -1914,16 +2053,6 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
         </div>
 
         <div className="flex items-center gap-3">
-          <label className="flex items-center gap-2 cursor-pointer select-none">
-            <span className="text-xs font-semibold text-foreground">Agent Active</span>
-            <input
-              type="checkbox"
-              checked={isActive}
-              onChange={(e) => setIsActive(e.target.checked)}
-              className="size-4 accent-emerald-600 rounded cursor-pointer"
-            />
-          </label>
-
           <button
             onClick={handleSave}
             disabled={saving}
@@ -1962,6 +2091,29 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
                   onClick={(e) => e.stopPropagation()}
                   className="absolute right-0 top-full mt-1.5 w-44 rounded-xl border border-border bg-popover shadow-xl py-1.5 z-30 animate-in fade-in zoom-in-95 duration-100"
                 >
+                  <button
+                    type="button"
+                    id="agent-detail-pause-btn"
+                    disabled={saving}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void handleTogglePauseAgent();
+                    }}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-xs font-medium text-foreground hover:bg-accent transition-colors text-left cursor-pointer disabled:opacity-50"
+                  >
+                    {isActive ? (
+                      <>
+                        <Pause className="size-3.5 text-amber-500 shrink-0" />
+                        <span>Pause agent</span>
+                      </>
+                    ) : (
+                      <>
+                        <Play className="size-3.5 text-emerald-500 shrink-0" />
+                        <span>Resume agent</span>
+                      </>
+                    )}
+                  </button>
+
                   <button
                     type="button"
                     id="agent-detail-delete-btn"
@@ -2045,20 +2197,6 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
             />
 
             <div className="space-y-1.5">
-              <label htmlFor="opening" className="text-xs font-bold text-foreground">
-                Opening line (optional)
-              </label>
-              <input
-                id="opening"
-                type="text"
-                placeholder="Hello! Welcome to our store. How can I help you today?"
-                value={openingLine}
-                onChange={(e) => setOpeningLine(e.target.value)}
-                className="w-full rounded-xl border border-border bg-background px-3.5 py-2.5 text-sm text-foreground placeholder:text-muted-foreground focus:border-primary focus:outline-none shadow-2xs"
-              />
-            </div>
-
-            <div className="space-y-1.5">
               <label htmlFor="tone" className="text-xs font-bold text-foreground">
                 Tone
               </label>
@@ -2128,6 +2266,13 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
               platforms={platforms}
             />
           )}
+
+          {/* Human Handoff (under Agent Instructions only) */}
+          <HumanHandoffSection
+            value={humanHandoff}
+            onChange={setHumanHandoff}
+            agentName={name || agent?.name}
+          />
         </div>
       )}
 
@@ -2166,6 +2311,10 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
           <NotificationChannelsSection
             value={notificationsConfig}
             onChange={setNotificationsConfig}
+            workspaceId={verifiedWorkspaceId || agent?.workspaceId || null}
+            agentId={!isNewAgent ? agent?.id || null : null}
+            agentName={name || agent?.name}
+            onNavigate={onNavigate}
           />
         </div>
       )}
@@ -2834,17 +2983,9 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
                   <h3 className="text-base font-bold text-foreground">
                     Agent Simulator
                   </h3>
-                  {simulatorConversationId && (
-                    <span
-                      className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-muted text-muted-foreground border border-border"
-                      title={`Active Conversation ID: ${simulatorConversationId}`}
-                    >
-                      #{simulatorConversationId.slice(0, 8)}
-                    </span>
-                  )}
                 </div>
                 <p className="text-xs text-muted-foreground mt-0.5">
-                  Test your agent. All conversations and messages are saved permanently in Supabase. Hover over any agent reply to rate and submit feedback.
+                  Test your agent. All conversations and messages are saved permanently. Hover over any agent reply to rate and submit feedback.
                 </p>
               </div>
 
@@ -2871,13 +3012,14 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
               </div>
             </div>
 
-            {/* Saved Test Conversations History Selector */}
-            <div className="space-y-2">
+            {/* Chat History Dropdown Selector */}
+            <div className="space-y-1.5">
               <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-1.5 text-xs font-semibold text-muted-foreground">
+                <div className="flex items-center gap-1.5 text-xs font-semibold text-foreground">
                   <History className="size-3.5 text-primary" />
-                  <span>
-                    Saved Test Conversations ({testConversations.length})
+                  <span>Chat History</span>
+                  <span className="text-[11px] font-medium text-muted-foreground">
+                    ({testConversations.length})
                   </span>
                 </div>
                 {isLoadingTestHistory && (
@@ -2889,54 +3031,198 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
               </div>
 
               {testConversations.length > 0 ? (
-                <div className="flex items-center gap-2 overflow-x-auto pb-1.5">
-                  {testConversations.map((conv, idx) => {
-                    const isSelected = conv.id === simulatorConversationId;
-                    const formattedDate = new Date(
-                      conv.last_message_at || conv.created_at
-                    ).toLocaleString([], {
-                      month: 'short',
-                      day: 'numeric',
-                      hour: '2-digit',
-                      minute: '2-digit',
-                    });
+                <div className="relative" onClick={(e) => e.stopPropagation()}>
+                  {(() => {
+                    const selectedIdx = testConversations.findIndex(
+                      (c) => c.id === simulatorConversationId
+                    );
+                    const activeConv =
+                      selectedIdx >= 0
+                        ? testConversations[selectedIdx]
+                        : testConversations[0];
+                    const activeConvLabel =
+                      activeConv?.title ||
+                      (selectedIdx >= 0
+                        ? `Conversation #${testConversations.length - selectedIdx}`
+                        : 'Select a saved conversation');
+                    const activeFormattedDate = activeConv
+                      ? new Date(
+                          activeConv.last_message_at || activeConv.created_at
+                        ).toLocaleString([], {
+                          month: 'short',
+                          day: 'numeric',
+                          hour: '2-digit',
+                          minute: '2-digit',
+                        })
+                      : '';
 
                     return (
-                      <button
-                        key={conv.id}
-                        type="button"
-                        onClick={() => handleSelectTestConversation(conv.id)}
-                        disabled={isWaitingReply || isCreatingConversation}
-                        className={`group flex flex-col items-start gap-1 rounded-xl border px-3 py-2 text-left transition-all shrink-0 max-w-[230px] cursor-pointer ${
-                          isSelected
-                            ? 'border-primary bg-primary/10 text-foreground shadow-2xs'
-                            : 'border-border bg-background/70 text-muted-foreground hover:border-primary/40 hover:text-foreground'
-                        }`}
-                      >
-                        <div className="flex items-center justify-between gap-2 w-full">
-                          <span className="text-xs font-semibold truncate max-w-[145px]">
-                            {conv.title || `Conversation #${testConversations.length - idx}`}
-                          </span>
-                          <span
-                            className={`text-[10px] px-1.5 py-0.2 rounded-md font-medium shrink-0 ${
-                              isSelected
-                                ? 'bg-primary text-primary-foreground'
-                                : 'bg-muted text-muted-foreground'
-                            }`}
-                          >
-                            {conv.message_count}{' '}
-                            {conv.message_count === 1 ? 'msg' : 'msgs'}
-                          </span>
-                        </div>
-                        <div className="flex items-center justify-between gap-2 w-full text-[10px] text-muted-foreground">
-                          <span className="font-mono">
-                            #{conv.id.slice(0, 6)}
-                          </span>
-                          <span>{formattedDate}</span>
-                        </div>
-                      </button>
+                      <>
+                        <button
+                          type="button"
+                          id="test-agent-chat-history-dropdown-btn"
+                          disabled={isWaitingReply || isCreatingConversation}
+                          onClick={() =>
+                            setIsChatHistoryOpen((prev) => !prev)
+                          }
+                          className="w-full flex items-center justify-between gap-3 rounded-xl border border-border bg-background px-3.5 py-2.5 text-left hover:border-primary/40 transition-colors shadow-2xs cursor-pointer disabled:opacity-50"
+                        >
+                          <div className="flex items-center gap-2.5 min-w-0">
+                            <History className="size-4 text-primary shrink-0" />
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2">
+                                <span className="text-xs font-semibold text-foreground truncate">
+                                  {activeConvLabel}
+                                </span>
+                                {activeConv && (
+                                  <span className="text-[10px] px-1.5 py-0.5 rounded-md font-medium bg-primary/10 text-primary shrink-0">
+                                    {activeConv.message_count}{' '}
+                                    {activeConv.message_count === 1
+                                      ? 'msg'
+                                      : 'msgs'}
+                                  </span>
+                                )}
+                              </div>
+                              {activeConv && (
+                                <div className="flex items-center gap-2 text-[10px] text-muted-foreground mt-0.5">
+                                  <span>{activeFormattedDate}</span>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+
+                          <div className="flex items-center gap-1.5 text-muted-foreground shrink-0">
+                            <span className="text-[11px] font-medium hidden sm:inline">
+                              {isChatHistoryOpen ? 'Close' : 'View history'}
+                            </span>
+                            {isChatHistoryOpen ? (
+                              <ChevronUp className="size-4" />
+                            ) : (
+                              <ChevronDown className="size-4" />
+                            )}
+                          </div>
+                        </button>
+
+                        {isChatHistoryOpen && (
+                          <div className="absolute left-0 right-0 top-full mt-1.5 rounded-xl border border-border bg-popover shadow-xl z-30 overflow-hidden animate-in fade-in zoom-in-95 duration-100">
+                            {/* Dropdown Header at Top */}
+                            <div className="flex items-center justify-between gap-2 px-3.5 py-2.5 border-b border-border bg-muted/40">
+                              <div className="flex items-center gap-1.5 text-xs font-bold text-foreground">
+                                <History className="size-3.5 text-primary" />
+                                <span>Chat History</span>
+                              </div>
+                              <span className="text-[10px] font-medium text-muted-foreground">
+                                {testConversations.length}{' '}
+                                {testConversations.length === 1
+                                  ? 'conversation'
+                                  : 'conversations'}
+                              </span>
+                            </div>
+
+                            {/* Dropdown List of Saved Conversations */}
+                            <div className="max-h-64 overflow-y-auto divide-y divide-border/60">
+                              {testConversations.map((conv, idx) => {
+                                const isSelected =
+                                  conv.id === simulatorConversationId;
+                                const isDeletingThis =
+                                  deletingTestConvId === conv.id;
+                                const formattedDate = new Date(
+                                  conv.last_message_at || conv.created_at
+                                ).toLocaleString([], {
+                                  month: 'short',
+                                  day: 'numeric',
+                                  hour: '2-digit',
+                                  minute: '2-digit',
+                                });
+
+                                return (
+                                  <div
+                                    key={conv.id}
+                                    className={`w-full flex items-center justify-between gap-2 px-3.5 py-2.5 transition-colors ${
+                                      isSelected
+                                        ? 'bg-primary/10 text-foreground'
+                                        : 'hover:bg-accent/60 text-muted-foreground hover:text-foreground'
+                                    }`}
+                                  >
+                                    <button
+                                      type="button"
+                                      disabled={
+                                        isWaitingReply ||
+                                        isCreatingConversation ||
+                                        isDeletingThis
+                                      }
+                                      onClick={() => {
+                                        setIsChatHistoryOpen(false);
+                                        void handleSelectTestConversation(conv.id);
+                                      }}
+                                      className="min-w-0 flex-1 text-left cursor-pointer disabled:opacity-50"
+                                    >
+                                      <div className="flex items-center gap-2">
+                                        <span
+                                          className={`text-xs truncate ${
+                                            isSelected
+                                              ? 'font-bold text-foreground'
+                                              : 'font-semibold text-foreground/90'
+                                          }`}
+                                        >
+                                          {conv.title ||
+                                            `Conversation #${testConversations.length - idx}`}
+                                        </span>
+                                        <span
+                                          className={`text-[10px] px-1.5 py-0.5 rounded-md font-medium shrink-0 ${
+                                            isSelected
+                                              ? 'bg-primary text-primary-foreground'
+                                              : 'bg-muted text-muted-foreground'
+                                          }`}
+                                        >
+                                          {conv.message_count}{' '}
+                                          {conv.message_count === 1
+                                            ? 'msg'
+                                            : 'msgs'}
+                                        </span>
+                                      </div>
+                                      <div className="flex items-center gap-2 text-[10px] text-muted-foreground mt-0.5">
+                                        <span>{formattedDate}</span>
+                                      </div>
+                                    </button>
+
+                                    <div className="flex items-center gap-1.5 shrink-0">
+                                      {isSelected && (
+                                        <CheckCircle2 className="size-4 text-primary shrink-0" />
+                                      )}
+                                      <button
+                                        type="button"
+                                        disabled={
+                                          isDeletingThis ||
+                                          isWaitingReply ||
+                                          isCreatingConversation
+                                        }
+                                        onClick={(e) =>
+                                          void handleDeleteTestConversation(
+                                            conv.id,
+                                            e
+                                          )
+                                        }
+                                        title="Delete chat"
+                                        aria-label="Delete chat"
+                                        className="p-1.5 rounded-lg text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors cursor-pointer disabled:opacity-50"
+                                      >
+                                        {isDeletingThis ? (
+                                          <Loader2 className="size-3.5 animate-spin text-destructive" />
+                                        ) : (
+                                          <Trash2 className="size-3.5" />
+                                        )}
+                                      </button>
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        )}
+                      </>
                     );
-                  })}
+                  })()}
                 </div>
               ) : (
                 !isLoadingTestHistory && (
@@ -2996,7 +3282,7 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
               {isLoadingTestHistory && chatMessages.length === 0 ? (
                 <div className="h-full flex flex-col items-center justify-center text-center gap-2 text-xs text-muted-foreground">
                   <Loader2 className="size-5 text-primary animate-spin" />
-                  <span>Loading saved test conversation from Supabase…</span>
+                  <span>Loading saved test conversation</span>
                 </div>
               ) : chatMessages.length === 0 ? (
                 <div className="h-full flex flex-col items-center justify-center text-center px-4 space-y-2">
@@ -3009,7 +3295,7 @@ export const AgentDetailPage: React.FC<AgentDetailPageProps> = ({
                       : 'Start testing your AI agent'}
                   </p>
                   <p className="text-xs text-muted-foreground max-w-sm leading-relaxed">
-                    Send a message below to test {name || 'your agent'}. Every user message and AI response in this conversation will be saved permanently in Supabase.
+                    Send a message below to test {name || 'your agent'}. Every user message and AI response in this conversation will be saved permanently.
                   </p>
                 </div>
               ) : (

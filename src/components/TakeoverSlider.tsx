@@ -1,8 +1,9 @@
 import React from 'react';
 import { Bot, User as UserIcon } from 'lucide-react';
+import { ConversationStatus } from '../types';
 
 interface TakeoverSliderProps {
-  status: 'agent_active' | 'human_takeover';
+  status: ConversationStatus;
   onChange: (target: 'human' | 'agent') => void;
   disabled?: boolean;
 }
@@ -13,7 +14,7 @@ export const TakeoverSlider: React.FC<TakeoverSliderProps> = ({
   disabled = false,
 }) => {
   const isAgent = status === 'agent_active';
-  const isHuman = status === 'human_takeover';
+  const isHuman = status === 'human_takeover' || status === 'human_needed';
 
   const handleSelect = (target: 'human' | 'agent') => {
     if (disabled) return;

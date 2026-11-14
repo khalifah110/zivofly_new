@@ -257,7 +257,7 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
     const email = body?.email || '';
     const password = body?.password || '';
     const name = body?.name || email.split('@')[0] || 'User';
-    const businessName = body?.businessName || 'My Business';
+    const businessName = body?.businessName || '';
 
     if (isSupabaseConfigured) {
       try {
@@ -832,15 +832,43 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
   if (takeoverMatch && method === 'POST') {
     const convId = takeoverMatch[1];
     const convs = getStored<Conversation[]>(STORAGE_KEYS.CONVERSATIONS, DEFAULT_CONVERSATIONS);
-    const conv = convs.find(c => c.id === convId);
-    if (!conv) return jsonResponse({ error: 'Conversation not found' }, 404);
+    let conv = convs.find(c => c.id === convId);
+    if (!conv && body?.conversation) {
+      conv = { ...body.conversation };
+      convs.unshift(conv!);
+    }
+    if (!conv) {
+      const nextStatus =
+        body?.status ||
+        (body?.target === 'human'
+          ? 'human_takeover'
+          : body?.target === 'human_needed'
+          ? 'human_needed'
+          : body?.target === 'resolved'
+          ? 'resolved'
+          : 'agent_active');
+      return jsonResponse({
+        conversation: {
+          id: convId,
+          status: nextStatus,
+          handoffReason: body?.handoffReason,
+        },
+        resumed: nextStatus === 'agent_active',
+      });
+    }
 
     if (body?.status) {
       conv.status = body.status;
     } else if (body?.target) {
-      conv.status = body.target === 'human' ? 'human_takeover' : 'agent_active';
+      if (body.target === 'human') conv.status = 'human_takeover';
+      else if (body.target === 'human_needed') conv.status = 'human_needed';
+      else if (body.target === 'resolved') conv.status = 'resolved';
+      else conv.status = 'agent_active';
     } else {
       conv.status = conv.status === 'human_takeover' ? 'agent_active' : 'human_takeover';
+    }
+    if (body?.handoffReason !== undefined) {
+      conv.handoffReason = body.handoffReason;
     }
     if (conv.status === 'agent_active') {
       conv.missedMessagesCountWhilePaused = 0;
@@ -956,8 +984,8 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
     const conv = convs.find(c => c.id === convId);
     if (!conv) return jsonResponse({ error: 'Conversation not found' }, 404);
 
-    const sender = body?.sender || 'agent';
-    const text = body?.text || body?.message || '';
+    const sender = (body?.sender || body?.role || 'agent') as 'customer' | 'agent' | 'human';
+    const text = body?.text || body?.message || body?.content || '';
 
     const newMsg = {
       id: `msg_${Date.now()}`,
@@ -977,8 +1005,9 @@ export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Pr
       }
     }
 
-    // If customer sent and agent is active, simulate agent reply
-    if (sender === 'customer' && conv.status !== 'human_takeover') {
+    // If customer sent and agent is active (AI Handling), simulate agent reply.
+    // Never auto-reply when status is human_needed, human_takeover, or resolved.
+    if (sender === 'customer' && conv.status === 'agent_active') {
       const agents = getStored<Agent[]>(STORAGE_KEYS.AGENTS, []);
       const agent = agents.find(a => a.id === conv.agentId) || DEFAULT_AGENT;
       const autoReply = generateAgentResponse(agent, text, conv.customerName);

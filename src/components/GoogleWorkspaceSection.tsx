@@ -56,6 +56,11 @@ export const GoogleWorkspaceSection: React.FC<GoogleWorkspaceSectionProps> = ({
   const [isLoadingStatus, setIsLoadingStatus] = useState<boolean>(false);
   const [connectingService, setConnectingService] =
     useState<GoogleWorkspaceServiceIdentifier | null>(null);
+  const [oauthDiagnosticError, setOauthDiagnosticError] = useState<{
+    appName: string;
+    service: GoogleWorkspaceServiceIdentifier;
+    message: string;
+  } | null>(null);
 
   const valueRef = useRef<GoogleWorkspaceConfig | undefined>(value);
   valueRef.current = value;
@@ -101,15 +106,21 @@ export const GoogleWorkspaceSection: React.FC<GoogleWorkspaceSectionProps> = ({
             applyConnectionsToParent(callbackRes.connectionsByService);
           }
           if (callbackRes.outcome === 'success') {
+            setOauthDiagnosticError(null);
             toast.success(
               callbackRes.message ||
                 `Connected ${callbackRes.serviceLabel || 'Google Workspace'} successfully!`
             );
           } else if (callbackRes.outcome === 'error') {
-            toast.error(
+            const errMessage =
               callbackRes.message ||
-                'Google Workspace authorization could not be completed.'
-            );
+              'Google Workspace authorization could not be completed.';
+            setOauthDiagnosticError({
+              appName: callbackRes.serviceLabel || 'Google Workspace',
+              service: callbackRes.service || 'gmail',
+              message: errMessage,
+            });
+            toast.error(errMessage, { duration: 8000 });
           }
           // If callback already fetched fresh connections from Supabase, we are up to date
           if (callbackRes.connectionsByService) {
@@ -243,6 +254,7 @@ export const GoogleWorkspaceSection: React.FC<GoogleWorkspaceSectionProps> = ({
     }
 
     setConnectingService(service);
+    setOauthDiagnosticError(null);
 
     try {
       const { authorizationUrl } = await startGoogleWorkspaceOAuth({
@@ -258,7 +270,12 @@ export const GoogleWorkspaceSection: React.FC<GoogleWorkspaceSectionProps> = ({
       const errMsg =
         err?.message ||
         `Could not start Google OAuth for ${appName}. Please try again.`;
-      toast.error(errMsg);
+      setOauthDiagnosticError({
+        appName,
+        service,
+        message: errMsg,
+      });
+      toast.error(errMsg, { duration: 8000 });
     }
   };
 
@@ -333,6 +350,29 @@ export const GoogleWorkspaceSection: React.FC<GoogleWorkspaceSectionProps> = ({
             <div className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground mb-1">
               Select & Connect Google Workspace Tools
             </div>
+
+            {oauthDiagnosticError && (
+              <div className="rounded-xl border border-red-500/25 bg-red-500/10 p-3.5 flex items-start justify-between gap-3">
+                <div className="flex items-start gap-2.5">
+                  <AlertCircle className="size-4 text-red-600 dark:text-red-400 shrink-0 mt-0.5" />
+                  <div className="space-y-1">
+                    <p className="text-xs font-semibold text-red-700 dark:text-red-300">
+                      {oauthDiagnosticError.appName} Connection Error
+                    </p>
+                    <p className="text-[11px] text-red-600/90 dark:text-red-400/90 leading-relaxed break-words">
+                      {oauthDiagnosticError.message}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setOauthDiagnosticError(null)}
+                  className="text-[11px] font-semibold text-red-600 dark:text-red-400 hover:underline shrink-0 cursor-pointer"
+                >
+                  Dismiss
+                </button>
+              </div>
+            )}
 
             <div className="grid grid-cols-1 gap-3">
               {apps.map((app) => {

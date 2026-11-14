@@ -71,8 +71,50 @@ function AppContent() {
   const loadData = async () => {
     setIsLoading(true);
     try {
-      // First verify Supabase session directly
+      const searchParams = new URLSearchParams(window.location.search || '');
+      const hashString = (window.location.hash || '').replace(/^#/, '');
+      const hashParams = new URLSearchParams(hashString);
+      const isGoogleWorkspaceCallback = searchParams.has('google_oauth');
+
+      // Handle OAuth error returned in URL query or hash
+      if (!isGoogleWorkspaceCallback) {
+        const oauthError =
+          searchParams.get('error_description') ||
+          hashParams.get('error_description') ||
+          searchParams.get('error') ||
+          hashParams.get('error');
+
+        if (oauthError) {
+          const decodedError = decodeURIComponent(oauthError.replace(/\+/g, ' '));
+          toast.error(decodedError);
+          window.history.replaceState({}, '', window.location.pathname || '/auth');
+          if (window.opener && window.opener !== window) {
+            try {
+              window.opener.postMessage(
+                { type: 'ZIVOFLY_GOOGLE_AUTH_ERROR', error: decodedError },
+                window.location.origin
+              );
+              window.close();
+            } catch {
+              // ignore
+            }
+          }
+        }
+      }
+
+      // First verify Supabase session directly (and exchange PKCE code if returning from Google OAuth)
       if (supabase) {
+        const oauthCode = !isGoogleWorkspaceCallback ? searchParams.get('code') : null;
+        const hasHashAccessToken = hashParams.has('access_token');
+
+        if (oauthCode) {
+          try {
+            await supabase.auth.exchangeCodeForSession(oauthCode);
+          } catch (codeErr) {
+            console.warn('[Zivofly] PKCE code exchange note:', codeErr);
+          }
+        }
+
         const { data: sessionData } = await supabase.auth.getSession();
         if (!sessionData?.session?.user) {
           setUser(null);
@@ -84,6 +126,35 @@ function AppContent() {
           localStorage.removeItem('zivofly_conversations');
           setIsLoading(false);
           return;
+        }
+
+        // Clean up OAuth tokens/codes from URL bar and notify opener if inside a popup
+        if (oauthCode || hasHashAccessToken) {
+          const cleanPath =
+            window.location.pathname === '/auth' || window.location.pathname === '/'
+              ? '/dashboard'
+              : window.location.pathname;
+          window.history.replaceState({}, '', cleanPath);
+          setCurrentPath(cleanPath);
+
+          try {
+            localStorage.setItem('zivofly_google_oauth_completed', String(Date.now()));
+          } catch {
+            // ignore
+          }
+
+          if (window.opener && window.opener !== window) {
+            try {
+              window.opener.postMessage(
+                { type: 'ZIVOFLY_GOOGLE_AUTH_SUCCESS' },
+                window.location.origin
+              );
+              window.close();
+              return;
+            } catch {
+              // ignore
+            }
+          }
         }
       }
 
@@ -98,8 +169,15 @@ function AppContent() {
         const ct = userRes.headers.get('content-type');
         if (ct?.includes('application/json')) {
           const uData = await userRes.json();
-          if (uData.user) setUser(uData.user);
-          else setUser(null);
+          if (uData.user) {
+            setUser(uData.user);
+            if (window.location.pathname === '/auth') {
+              window.history.replaceState({}, '', '/dashboard');
+              setCurrentPath('/dashboard');
+            }
+          } else {
+            setUser(null);
+          }
         }
       }
 
@@ -148,6 +226,19 @@ function AppContent() {
           localStorage.removeItem('zivofly_agents');
           localStorage.removeItem('zivofly_connections');
           localStorage.removeItem('zivofly_conversations');
+          if (window.opener && window.opener !== window) {
+            try {
+              localStorage.setItem('zivofly_google_oauth_completed', String(Date.now()));
+              window.opener.postMessage(
+                { type: 'ZIVOFLY_GOOGLE_AUTH_SUCCESS' },
+                window.location.origin
+              );
+              window.close();
+              return;
+            } catch {
+              // ignore
+            }
+          }
           loadData();
         } else if (event === 'SIGNED_OUT') {
           setUser(null);
@@ -346,6 +437,7 @@ function AppContent() {
           agents={agents}
           onNavigate={navigate}
           onAgentCreated={handleAgentCreated}
+          onAgentUpdated={handleAgentUpdated}
           onAgentDeleted={handleAgentDeleted}
         />
       );

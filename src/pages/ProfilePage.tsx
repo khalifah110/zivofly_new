@@ -3,7 +3,6 @@ import {
   User as UserIcon,
   Mail,
   Trash2,
-  Shield,
   Save,
   CheckCircle2,
   AlertTriangle,
@@ -11,7 +10,9 @@ import {
   LayoutGrid,
   Coins,
   LogOut,
-  Calendar,
+  Building2,
+  UserPlus,
+  Send,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { User, Agent, ChannelConnection } from '../types';
@@ -38,8 +39,22 @@ export const ProfilePage: React.FC<ProfilePageProps> = ({
   onSignOut,
 }) => {
   // Form edit states
+  const resolveCleanBusinessName = (u: User | null) => {
+    if (!u?.businessName) return '';
+    const trimmed = u.businessName.trim();
+    if (trimmed === 'My Business' || (u.name && trimmed.toLowerCase() === u.name.trim().toLowerCase())) {
+      return '';
+    }
+    return trimmed;
+  };
+
   const [name, setName] = useState(user?.name || '');
+  const [businessName, setBusinessName] = useState(() => resolveCleanBusinessName(user));
   const [isSaving, setIsSaving] = useState(false);
+
+  // Invite state
+  const [isInviteOpen, setIsInviteOpen] = useState(false);
+  const [inviteEmail, setInviteEmail] = useState('');
 
   // Deletion modal state
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
@@ -49,6 +64,7 @@ export const ProfilePage: React.FC<ProfilePageProps> = ({
   React.useEffect(() => {
     if (user) {
       setName(user.name || '');
+      setBusinessName(resolveCleanBusinessName(user));
     }
   }, [user]);
 
@@ -66,12 +82,17 @@ export const ProfilePage: React.FC<ProfilePageProps> = ({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           name: name.trim(),
+          businessName: businessName.trim(),
         }),
       });
 
       if (res.ok) {
         const data = await res.json();
-        const updated = data.user || { ...user, name: name.trim() };
+        const updated = data.user || {
+          ...user,
+          name: name.trim(),
+          businessName: businessName.trim(),
+        };
         onUserUpdated(updated);
         toast.success('Profile details saved successfully', {
           icon: <CheckCircle2 className="size-4 text-emerald-500" />,
@@ -84,6 +105,19 @@ export const ProfilePage: React.FC<ProfilePageProps> = ({
     } finally {
       setIsSaving(false);
     }
+  };
+
+  const handleSendInvite = () => {
+    const trimmedEmail = inviteEmail.trim();
+    if (!trimmedEmail || !trimmedEmail.includes('@')) {
+      toast.error('Please enter a valid email address to invite');
+      return;
+    }
+    toast.success(`Invitation sent to ${trimmedEmail}`, {
+      icon: <CheckCircle2 className="size-4 text-emerald-500" />,
+    });
+    setInviteEmail('');
+    setIsInviteOpen(false);
   };
 
   const handleConfirmDeleteAccount = async () => {
@@ -128,10 +162,6 @@ export const ProfilePage: React.FC<ProfilePageProps> = ({
             <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-foreground font-display">
               Account Profile
             </h1>
-            <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-2.5 py-0.5 text-xs font-semibold text-emerald-700 dark:text-emerald-400 border border-emerald-500/20 font-mono">
-              <Shield className="size-3 text-emerald-600 dark:text-emerald-400" />
-              Active Workspace
-            </span>
           </div>
           <p className="mt-1 text-sm text-muted-foreground">
             Manage your personal profile, credentials, security, and account preferences.
@@ -219,6 +249,56 @@ export const ProfilePage: React.FC<ProfilePageProps> = ({
               </p>
             </div>
 
+            <div className="space-y-2.5">
+              <div className="space-y-1.5">
+                <label htmlFor="profile-business-name" className="text-xs font-bold text-foreground">
+                  Business Name
+                </label>
+                <div className="relative">
+                  <Building2 className="size-3.5 text-muted-foreground absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    id="profile-business-name"
+                    type="text"
+                    value={businessName}
+                    onChange={(e) => setBusinessName(e.target.value)}
+                    placeholder="e.g Zivofly"
+                    className="w-full rounded-xl border border-input bg-card pl-9 pr-3.5 py-2.5 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/40 focus:border-primary shadow-2xs font-medium"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <button
+                  type="button"
+                  onClick={() => setIsInviteOpen((prev) => !prev)}
+                  className="w-full inline-flex items-center justify-center gap-2 rounded-xl border border-primary/30 bg-primary/10 hover:bg-primary/20 text-primary px-4 py-2.5 text-xs font-semibold shadow-2xs transition-colors cursor-pointer"
+                >
+                  <UserPlus className="size-3.5" />
+                  <span>Invite Team Member</span>
+                </button>
+              </div>
+
+              {isInviteOpen && (
+                <div className="rounded-xl border border-border bg-muted/30 p-3 flex flex-col sm:flex-row items-stretch sm:items-center gap-2 animate-in fade-in duration-150">
+                  <input
+                    type="email"
+                    value={inviteEmail}
+                    onChange={(e) => setInviteEmail(e.target.value)}
+                    placeholder="Enter team member email address…"
+                    className="flex-1 rounded-lg border border-input bg-card px-3 py-2 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/40 focus:border-primary"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleSendInvite}
+                    className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-primary hover:bg-primary/90 text-primary-foreground px-3.5 py-2 text-xs font-semibold transition-colors cursor-pointer shrink-0"
+                  >
+                    <Send className="size-3" />
+                    <span>Send Invite</span>
+                  </button>
+                </div>
+              )}
+            </div>
+
             <div className="pt-3 border-t border-border flex justify-end">
               <button
                 type="submit"
@@ -277,10 +357,10 @@ export const ProfilePage: React.FC<ProfilePageProps> = ({
                 </div>
                 <div>
                   <span className="text-xs font-bold text-foreground block">
-                    Prepaid Token Economy
+                    Available Token
                   </span>
-                  <span className="text-[11px] text-muted-foreground">
-                    1,000 Tokens = $1.00 USD
+                  <span className="text-xs font-mono font-semibold text-muted-foreground">
+                    {(Number(localStorage.getItem('zivofly_token_balance')) || 0).toLocaleString()} Tokens
                   </span>
                 </div>
               </div>

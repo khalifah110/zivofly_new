@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { Bot, ArrowRight, Plus, MoreVertical, Trash2, Sparkles, Search, X, SlidersHorizontal } from 'lucide-react';
+import { Bot, ArrowRight, Plus, MoreVertical, Trash2, Pause, Play, Loader2, Sparkles, Search, X, SlidersHorizontal } from 'lucide-react';
 import { toast } from 'sonner';
 import { Agent } from '../types';
 import { apiFetch } from '../lib/api';
@@ -10,6 +10,7 @@ interface AgentsPageProps {
   agents: Agent[];
   onNavigate: (path: string) => void;
   onAgentCreated: (agent: Agent) => void;
+  onAgentUpdated?: (agent: Agent) => void;
   onAgentDeleted: (agentId: string) => void;
 }
 
@@ -17,16 +18,18 @@ export const AgentsPage: React.FC<AgentsPageProps> = ({
   agents,
   onNavigate,
   onAgentCreated,
+  onAgentUpdated,
   onAgentDeleted,
 }) => {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const searchInputRef = useRef<HTMLInputElement>(null);
 
-  // Three-dot popover menu and deletion states
+  // Three-dot popover menu and deletion/pause states
   const [openMenuAgentId, setOpenMenuAgentId] = useState<string | null>(null);
   const [agentToDelete, setAgentToDelete] = useState<Agent | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [togglingPauseAgentId, setTogglingPauseAgentId] = useState<string | null>(null);
   const [newlyCreatedAgentId, setNewlyCreatedAgentId] = useState<string | null>(null);
 
   // Keyboard shortcut for search focus
@@ -63,6 +66,51 @@ export const AgentsPage: React.FC<AgentsPageProps> = ({
       return matchName || matchRole || matchDesc;
     });
   }, [agents, searchQuery]);
+
+  const handleTogglePauseAgent = async (agent: Agent) => {
+    if (togglingPauseAgentId === agent.id) return;
+    const nextStatus = agent.status === 'active' ? 'paused' : 'active';
+    setTogglingPauseAgentId(agent.id);
+    setOpenMenuAgentId(null);
+
+    try {
+      const updatedPayload: Agent = {
+        ...agent,
+        status: nextStatus,
+      };
+      const res = await apiFetch(`/api/agents/${agent.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updatedPayload),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        if (onAgentUpdated && data.agent) {
+          onAgentUpdated(data.agent);
+        }
+        toast.success(
+          nextStatus === 'paused'
+            ? `Agent "${agent.name}" paused`
+            : `Agent "${agent.name}" resumed`
+        );
+      } else {
+        toast.error(
+          nextStatus === 'paused'
+            ? 'Failed to pause agent'
+            : 'Failed to resume agent'
+        );
+      }
+    } catch {
+      toast.error(
+        nextStatus === 'paused'
+          ? 'Could not pause agent'
+          : 'Could not resume agent'
+      );
+    } finally {
+      setTogglingPauseAgentId(null);
+    }
+  };
 
   const handleConfirmDelete = async () => {
     if (!agentToDelete) return;
@@ -265,6 +313,30 @@ export const AgentsPage: React.FC<AgentsPageProps> = ({
                               onClick={(e) => e.stopPropagation()}
                               className="absolute right-0 top-full mt-1.5 w-44 rounded-xl border border-border bg-popover shadow-xl py-1.5 z-30 animate-in fade-in zoom-in-95 duration-100"
                             >
+                              <button
+                                type="button"
+                                id={`agent-pause-btn-${agent.id}`}
+                                disabled={togglingPauseAgentId === agent.id}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void handleTogglePauseAgent(agent);
+                                }}
+                                className="w-full flex items-center gap-2 px-3 py-2 text-xs font-medium text-foreground hover:bg-accent transition-colors text-left cursor-pointer disabled:opacity-50"
+                              >
+                                {togglingPauseAgentId === agent.id ? (
+                                  <Loader2 className="size-3.5 animate-spin text-muted-foreground shrink-0" />
+                                ) : agent.status === 'active' ? (
+                                  <Pause className="size-3.5 text-amber-500 shrink-0" />
+                                ) : (
+                                  <Play className="size-3.5 text-emerald-500 shrink-0" />
+                                )}
+                                <span>
+                                  {agent.status === 'active'
+                                    ? 'Pause agent'
+                                    : 'Resume agent'}
+                                </span>
+                              </button>
+
                               <button
                                 type="button"
                                 id={`agent-delete-btn-${agent.id}`}

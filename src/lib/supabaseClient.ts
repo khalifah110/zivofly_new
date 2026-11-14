@@ -33,6 +33,41 @@ export const isSupabaseConfigured: boolean = Boolean(
 // Instantiate singleton Supabase client
 let clientInstance: SupabaseClient | null = null;
 
+/**
+ * Custom fetch wrapper for the Supabase client.
+ * The deployed `google_workspace` Edge Function returns:
+ *   `Access-Control-Allow-Headers: authorization, apikey, content-type`
+ * Meanwhile, `@supabase/supabase-js` injects `X-Client-Info` by default on `supabase.functions.invoke()`,
+ * which causes browser OPTIONS preflight requests to fail with a CORS header error
+ * ("Failed to send a request to the Edge Function").
+ * Removing `x-client-info` (and W3C trace headers) on `/functions/v1/google_workspace` requests ensures
+ * only the permitted `authorization`, `apikey`, and `content-type` headers are sent.
+ */
+const supabaseCustomFetch: typeof fetch = async (input, init) => {
+  const requestUrl =
+    typeof input === 'string'
+      ? input
+      : input instanceof URL
+      ? input.toString()
+      : input?.url || '';
+
+  if (requestUrl.includes('/functions/v1/google_workspace')) {
+    const cleanedHeaders = new Headers(init?.headers);
+    cleanedHeaders.delete('x-client-info');
+    cleanedHeaders.delete('X-Client-Info');
+    cleanedHeaders.delete('traceparent');
+    cleanedHeaders.delete('tracestate');
+    cleanedHeaders.delete('baggage');
+
+    return fetch(input, {
+      ...init,
+      headers: cleanedHeaders,
+    });
+  }
+
+  return fetch(input, init);
+};
+
 if (isSupabaseConfigured) {
   try {
     clientInstance = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
@@ -41,6 +76,9 @@ if (isSupabaseConfigured) {
         autoRefreshToken: true,
         detectSessionInUrl: true,
         storageKey: 'zivofly_supabase_auth_token',
+      },
+      global: {
+        fetch: supabaseCustomFetch,
       },
     });
   } catch (err) {

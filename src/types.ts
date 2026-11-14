@@ -260,12 +260,67 @@ export interface NotificationsConfig {
   };
 }
 
+export type NotificationCategory =
+  | 'communication_channels'
+  | 'business_activities'
+  | 'agent_activities';
+
+export type WorkspaceNotificationEventType =
+  | 'whatsapp_message'
+  | 'instagram_message'
+  | 'facebook_message'
+  | 'tiktok_activity'
+  | 'new_sale'
+  | 'new_booking'
+  | 'customer_inquiry'
+  | 'human_assistance'
+  | 'agent_paused'
+  | 'agent_resumed'
+  | 'agent_error';
+
+export interface PushNotificationMetadata {
+  pushChannelId: string;
+  priority: 'high' | 'normal';
+  deepLinkUrl?: string;
+  collapseKey?: string;
+}
+
+export interface WorkspaceNotification {
+  id: string;
+  workspaceId: string;
+  agentId?: string;
+  category: NotificationCategory;
+  eventType: WorkspaceNotificationEventType;
+  channelOrEventLabel: string;
+  title: string;
+  message: string;
+  createdAt: string;
+  read: boolean;
+  targetRoute?: string;
+  pushMetadata?: PushNotificationMetadata;
+}
+
 export interface WhatItRepliesToConfig {
   replyDMs: boolean;
   replyComments: boolean;
   commentKeywords: string;
   replyTags: boolean;
   tagAllowedAccounts: string;
+}
+
+export type HumanHandoffWaitingTime =
+  | '5m'
+  | '10m'
+  | '15m'
+  | '30m'
+  | '1h'
+  | '2h'
+  | 'never';
+
+export interface HumanHandoffConfig {
+  enabled: boolean;
+  waitingTime: HumanHandoffWaitingTime;
+  holdingMessage: string;
 }
 
 export interface CustomVoiceConfig {
@@ -291,6 +346,7 @@ export interface Agent {
   openingLine?: string;
   tone?: string;
   customVoice?: CustomVoiceConfig;
+  humanHandoff?: HumanHandoffConfig;
   status: 'active' | 'paused' | 'draft';
   manualPauseWarningShown?: boolean;
   platformConfig: PlatformConfig;
@@ -318,9 +374,16 @@ export interface ChatMessage {
   feedbackCreatedAt?: string;
 }
 
+export type ConversationStatus =
+  | 'agent_active'
+  | 'human_needed'
+  | 'human_takeover'
+  | 'resolved';
+
 export interface Conversation {
   id: string;
   agentId: string;
+  agentName?: string;
   userId: string;
   platform: PlatformType;
   customerName: string;
@@ -329,7 +392,8 @@ export interface Conversation {
   lastMessageText: string;
   lastMessageTime: string;
   unread: boolean;
-  status: 'agent_active' | 'human_takeover';
+  status: ConversationStatus;
+  handoffReason?: string;
   rating?: number; // 1 to 5 stars
   feedbackComment?: string;
   feedbackTags?: string[];
@@ -373,3 +437,5 @@ export interface WebhookEventPayload {
   }>;
   keywordMatched?: string;
 }
+
+
