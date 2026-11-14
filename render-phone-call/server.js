@@ -4,10 +4,10 @@ import { createClient } from "@supabase/supabase-js";
 import { WebSocketServer, WebSocket } from "ws";
 
 const PORT = Number(process.env.PORT || 3000);
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RETELL_API_KEY = process.env.RETELL_API_KEY;
-const BRIDGE_SECRET = process.env.RETELL_API_WEBSTOCK;
+const SUPABASE_URL = process.env.supabase_url;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.supabase_secret_role_key;
+const RETELL_API_KEY = process.env.retell_api_key;
+const BRIDGE_SECRET = process.env.retell_api_webstock;
 
 const json = (res, body, status = 200) => {
   res.writeHead(status, {
